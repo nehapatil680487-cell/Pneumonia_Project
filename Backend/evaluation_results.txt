@@ -1,0 +1,18 @@
+Loading and testing each model on its own test set
+  X-ray NORMAL: 234 images
+  X-ray PNEUMONIA: 390 images
+  Blood features used by the model: ['Age', 'Gender', 'Platelet_Count', 'White_Blood_Cells', 'Red_Blood_Cells', 'MCV', 'MCH', 'MCHC']
+  Oxygen 3-class accuracy (Normal / Low / Very low): 1.000  (n=1182)
+
+Individual models (own test sets, threshold 0.5)
+  X-ray   accuracy=0.902  sensitivity=0.900  specificity=0.906  (n=624)
+  Blood   accuracy=0.947  sensitivity=0.750  specificity=1.000  (n=19)
+  Oxygen  accuracy=1.000  sensitivity=1.000  specificity=1.000  (n=1182)
+
+COMBINED SYSTEM - SIMULATED pairing (100 random pairings, n=624 X-ray test cases)
+  accuracy     0.993 +/- 0.003
+  sensitivity  0.988 +/- 0.005
+  specificity  1.000 +/- 0.000
+  precision    1.000 +/- 0.000
+
+Note: simulated and optimistic (blood label = anemia, oxygen label = SpO2 cut-off).

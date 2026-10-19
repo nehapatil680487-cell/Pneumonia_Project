@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+    <title>Medical Report System</title>
+
+    <style>
+
+        body{
+            font-family: Arial;
+            background:#f2f6fc;
+            padding:20px;
+        }
+
+        .container{
+            width:700px;
+            margin:auto;
+            background:white;
+            padding:30px;
+            border-radius:10px;
+            box-shadow:0px 0px 10px gray;
+        }
+
+        h1{
+            text-align:center;
+            color:darkblue;
+        }
+
+        h2{
+            color:#004080;
+            margin-top:25px;
+        }
+
+        label{
+            font-weight:bold;
+        }
+
+        input, textarea, select{
+            width:100%;
+            padding:10px;
+            margin-top:5px;
+            margin-bottom:15px;
+            border-radius:5px;
+            border:1px solid gray;
+        }
+
+        button{
+            width:100%;
+            padding:15px;
+            background:blue;
+            color:white;
+            border:none;
+            border-radius:5px;
+            font-size:18px;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>AI Medical Report Generator</h1>
+
+    <form action="/generate-report" method="post">
+
+        <h2>Patient Details</h2>
+
+        <label>Patient Name</label>
+        <input type="text" name="patient_name">
+
+        <label>Age</label>
+        <input type="number" name="age">
+
+        <label>Gender</label>
+        <select name="gender">
+            <option>Male</option>
+            <option>Female</option>
+        </select>
+
+
+        <h2>Chest X-ray Result</h2>
+
+        <label>X-ray Analysis</label>
+        <textarea name="chest_xray_result"></textarea>
+
+
+        <h2>Blood Count Report</h2>
+
+        <label>WBC</label>
+        <input type="text" name="wbc">
+
+        <label>RBC</label>
+        <input type="text" name="rbc">
+
+        <label>Platelet</label>
+        <input type="text" name="platelet">
+
+        <label>Hemoglobin (HB)</label>
+        <input type="text" name="hb">
+
+
+        <h2>Oxygen Monitoring</h2>
+
+        <label>Temperature</label>
+        <input type="text" name="temperature">
+
+        <label>SpO2</label>
+        <input type="text" name="spo2">
+
+        <label>Pulse Rate</label>
+        <input type="text" name="pulse_rate">
+
+
+        <button type="submit">
+            Generate Medical Report
+        </button>
+
+    </form>
+
+</div>
+
+</body>
+</html>

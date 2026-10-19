@@ -1,0 +1,2661 @@
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from database import get_connection
+
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
+import numpy as np
+import cv2
+import os
+import uuid
+import html
+import traceback
+import joblib
+import hashlib
+from datetime import datetime
+from database import get_connection
+
+
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, HRFlowable, KeepTogether
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+
+# =========================
+# APP SETUP
+# =========================
+app = FastAPI()
+
+os.makedirs("static", exist_ok=True)
+os.makedirs("reports", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# folder for autofill.js (kept outside "static" because static/ is auto-cleaned)
+os.makedirs("assets", exist_ok=True)
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+
+IMG_SIZE = 224
+
+# =========================
+# MODEL OUTPUT POLARITY
+# =========================
+POSITIVE_CLASS_IS_PNEUMONIA_WHEN_PROB_HIGH = True
+
+PDF_STORE = {}
+
+
+def cleanup_old_files(directory, max_age_seconds=3600):
+    try:
+        now = datetime.now().timestamp()
+        for fname in os.listdir(directory):
+            fpath = os.path.join(directory, fname)
+            try:
+                if os.path.isfile(fpath) and (now - os.path.getmtime(fpath)) > max_age_seconds:
+                    os.remove(fpath)
+            except OSError:
+                pass
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_stale_pdf_store_entries(max_age_seconds=3600):
+    stale_ids = [rid for rid, path in PDF_STORE.items() if not os.path.exists(path)]
+    for rid in stale_ids:
+        PDF_STORE.pop(rid, None)
+
+
+# =========================
+# LOAD MODELS
+# =========================
+try:
+    model = load_model("final_model.keras")
+    try:
+        _ = model(np.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype="float32"))
+    except Exception as build_err:
+        print("Model warm-up call failed (non-fatal):", build_err)
+    print("Model loaded successfully")
+except Exception as e:
+    model = None
+    print("Model load error:", e)
+
+
+try:
+    crp_model = load_model("crp_model.h5")
+    crp_scaler = joblib.load("crp_scaler.pkl")
+    print("CRP severity model loaded successfully")
+except Exception as e:
+    crp_model = None
+    crp_scaler = None
+    print("CRP severity model load error:", e)
+
+
+# --- Blood ANN (STAGE 1 signal) ---
+try:
+    blood_model = load_model("blood_model.h5")
+    blood_scaler = joblib.load("blood_scaler.pkl")
+    BLOOD_FEATURE_ORDER = ["Age", "Gender", "Hemoglobin", "Platelet_Count",
+                            "White_Blood_Cells", "Red_Blood_Cells", "MCV", "MCH", "MCHC"]
+    _blood_mean = dict(zip(BLOOD_FEATURE_ORDER, blood_scaler.mean_))
+    print("Blood ANN model loaded successfully")
+except Exception as e:
+    blood_model = None
+    blood_scaler = None
+    _blood_mean = {}
+    print("Blood ANN model load error:", e)
+
+
+# --- Oxygen ANN (STAGE 1 signal) ---
+# Now uses "Pneumonia-leaning" labels instead of NSCAP/SCAP-leaning.
+try:
+    oxygen_model = load_model("oxygen_model.h5")
+    oxygen_scaler = joblib.load("oxygen_scaler.pkl")
+    OXYGEN_FEATURE_ORDER = ["spo2", "pulse_rate", "temperature"]
+    OXYGEN_CLASS_LABELS = ["Normal", "Pneumonia-leaning", "Pneumonia-leaning"]
+    print("Oxygen ANN model loaded successfully")
+except Exception as e:
+    oxygen_model = None
+    oxygen_scaler = None
+    print("Oxygen ANN model load error:", e)
+
+
+# =========================
+# PREPROCESS IMAGE
+# =========================
+def preprocess(file_bytes):
+    img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise ValueError("Invalid image")
+
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    img_norm = img.astype("float32") / 255.0
+
+    return img, np.expand_dims(img_norm, axis=0)
+
+
+def get_last_conv(model):
+    last_name = None
+    layer_owner = model
+
+    def scan(m):
+        nonlocal last_name, layer_owner
+        for layer in m.layers:
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_name = layer.name
+                layer_owner = m
+            elif isinstance(layer, tf.keras.Model):
+                scan(layer)
+
+    scan(model)
+    return last_name, layer_owner
+
+
+REFERENCE_RANGES = {
+    "wbc":         {"label": "WBC",          "unit": "cells/mcL", "low": 4000,  "high": 11000},
+    "rbc":         {"label": "RBC",          "unit": "mill/mcL",  "low": 4.2,   "high": 5.9},
+    "platelet":    {"label": "Platelets",    "unit": "x10<super>3</super>/mcL", "low": 150,  "high": 450},
+    "hb":          {"label": "Hemoglobin",   "unit": "g/dL",      "low": 12.0,  "high": 17.5},
+    "temperature": {"label": "Temperature",  "unit": "\u00b0F",   "low": 97.0,  "high": 99.0},
+    "spo2":        {"label": "SpO2",         "unit": "%",         "low": 95,    "high": 100},
+    "pulse_rate":  {"label": "Pulse Rate",   "unit": "bpm",       "low": 60,    "high": 100},
+    "crp":         {"label": "CRP",          "unit": "mg/L",      "low": 0,     "high": 10},
+}
+
+
+def evaluate_value(key, raw_value):
+    ref = REFERENCE_RANGES[key]
+    label = ref["label"]
+    unit = ref["unit"]
+    range_str = f"{ref['low']} - {ref['high']}"
+
+    raw_str = "" if raw_value is None else str(raw_value).strip()
+
+    if raw_str == "":
+        return {
+            "label": label, "value": "-", "unit": unit,
+            "range": range_str, "flag": "N/A"
+        }
+
+    try:
+        value = float(raw_str)
+    except (ValueError, TypeError):
+        return {
+            "label": label, "value": "-", "unit": unit,
+            "range": range_str, "flag": "N/A"
+        }
+
+    unit_warning = None
+
+    if key == "platelet" and value > 1000:
+        value = value / 1000.0
+        unit_warning = "auto-converted from absolute count to x10\u00b3/mcL"
+    elif key == "temperature" and 30 <= value <= 45:
+        value = value * 9 / 5 + 32
+        unit_warning = "auto-converted from \u00b0C to \u00b0F"
+
+    if value < ref["low"]:
+        flag = "Low"
+    elif value > ref["high"]:
+        flag = "High"
+    else:
+        flag = "Normal"
+
+    value_str = f"{value:g}"
+    if unit_warning:
+        value_str += " *"
+
+    return {
+        "label": label, "value": value_str, "unit": unit,
+        "range": range_str, "flag": flag, "unit_warning": unit_warning
+    }
+
+
+def evaluate_all_vitals(vitals):
+    order = ["temperature", "spo2", "pulse_rate", "wbc", "rbc", "platelet", "hb", "crp"]
+    return [evaluate_value(key, vitals.get(key, "")) for key in order]
+
+
+# =========================
+# STAGE 1: MULTIMODAL PNEUMONIA DETECTION
+# =========================
+
+def predict_blood_ann(age_raw, hb_raw, platelet_raw, wbc_raw, rbc_raw):
+    if blood_model is None or blood_scaler is None:
+        return {"available": False, "reason": "Blood ANN model unavailable."}
+
+    required = {"Hemoglobin": hb_raw, "Platelets": platelet_raw, "WBC": wbc_raw, "RBC": rbc_raw}
+    missing = [k for k, v in required.items() if str(v).strip() == ""]
+    if missing:
+        return {"available": False, "reason": f"Missing required value(s) for Blood ANN: {', '.join(missing)}."}
+
+    try:
+        hb = float(hb_raw)
+        platelet_k = float(platelet_raw)
+        wbc = float(wbc_raw)
+        rbc = float(rbc_raw)
+    except (ValueError, TypeError):
+        return {"available": False, "reason": "Blood ANN inputs could not be parsed as numbers."}
+
+    platelet_absolute = platelet_k * 1000.0
+
+    try:
+        age = float(age_raw)
+    except (ValueError, TypeError):
+        age = _blood_mean.get("Age", 40.0)
+
+    feature_values = {
+        "Age": age,
+        "Gender": _blood_mean.get("Gender", 0.5),
+        "Hemoglobin": hb,
+        "Platelet_Count": platelet_absolute,
+        "White_Blood_Cells": wbc,
+        "Red_Blood_Cells": rbc,
+        "MCV": _blood_mean.get("MCV"),
+        "MCH": _blood_mean.get("MCH"),
+        "MCHC": _blood_mean.get("MCHC"),
+    }
+
+    try:
+        X = np.array([[feature_values[f] for f in BLOOD_FEATURE_ORDER]], dtype="float32")
+        X_scaled = blood_scaler.transform(X)
+        prob = float(blood_model.predict(X_scaled, verbose=0).squeeze())
+        return {"available": True, "prob": prob, "is_positive": prob > 0.5, "partial_profile": True}
+    except Exception as e:
+        print("Blood ANN prediction error:", e)
+        return {"available": False, "reason": "Blood ANN prediction failed."}
+
+
+def predict_oxygen_ann(spo2_raw, pulse_rate_raw, temperature_raw):
+    if oxygen_model is None or oxygen_scaler is None:
+        return {"available": False, "reason": "Oxygen ANN model unavailable."}
+
+    required = {"SpO2": spo2_raw, "Pulse Rate": pulse_rate_raw, "Temperature": temperature_raw}
+    missing = [k for k, v in required.items() if str(v).strip() == ""]
+    if missing:
+        return {"available": False, "reason": f"Missing required value(s) for Oxygen ANN: {', '.join(missing)}."}
+
+    try:
+        spo2 = float(spo2_raw)
+        pulse_rate = float(pulse_rate_raw)
+        temperature = float(temperature_raw)
+    except (ValueError, TypeError):
+        return {"available": False, "reason": "Oxygen ANN inputs could not be parsed as numbers."}
+
+    try:
+        X = np.array([[spo2, pulse_rate, temperature]], dtype="float32")
+        X_scaled = oxygen_scaler.transform(X)
+        probs = oxygen_model.predict(X_scaled, verbose=0).squeeze()
+        probs = [float(p) for p in probs]
+        class_idx = int(np.argmax(probs))
+        class_label = OXYGEN_CLASS_LABELS[class_idx]
+        is_positive = class_idx in (1, 2)
+        return {
+            "available": True,
+            "class_label": class_label,
+            "class_probs": probs,
+            "is_positive": is_positive,
+            "confidence": probs[class_idx] * 100,
+        }
+    except Exception as e:
+        print("Oxygen ANN prediction error:", e)
+        return {"available": False, "reason": "Oxygen ANN prediction failed."}
+
+
+def combine_stage1(cnn_is_positive, cnn_confidence, blood_result, oxygen_result):
+    components = [{
+        "name": "X-ray CNN",
+        "available": True,
+        "is_positive": cnn_is_positive,
+        "result": "Positive" if cnn_is_positive else "Normal",
+        "detail": f"{cnn_confidence:.1f}% confidence",
+    }]
+
+    if blood_result.get("available"):
+        components.append({
+            "name": "Blood ANN",
+            "available": True,
+            "is_positive": blood_result["is_positive"],
+            "result": "Positive" if blood_result["is_positive"] else "Normal",
+            "detail": f"{blood_result['prob'] * 100:.1f}% probability (partial profile)",
+        })
+    else:
+        components.append({
+            "name": "Blood ANN", "available": False, "is_positive": None,
+            "result": "Not assessed", "detail": blood_result.get("reason", ""),
+        })
+
+    if oxygen_result.get("available"):
+        oxygen_positive = bool(oxygen_result["is_positive"])
+
+        # For display in Stage 1, map any pneumonia-leaning to "Positive"
+        oxygen_display_label = oxygen_result["class_label"]
+        if "Pneumonia-leaning" in oxygen_display_label:
+            oxygen_display_label = "Positive"
+
+        components.append({
+            "name": "Oxygen ANN",
+            "available": True,
+            "is_positive": oxygen_positive,
+            "result": oxygen_display_label,
+            "detail": f"{oxygen_result['confidence']:.1f}% confidence",
+        })
+    else:
+        components.append({
+            "name": "Oxygen ANN", "available": False, "is_positive": None,
+            "result": "Not assessed", "detail": oxygen_result.get("reason", ""),
+        })
+
+    voting = [c for c in components if c["available"]]
+    votes_positive = sum(1 for c in voting if c["is_positive"])
+    votes_total = len(voting)
+
+    is_positive = votes_positive > votes_total / 2
+
+    return {
+        "is_positive": is_positive,
+        "label": "PNEUMONIA DETECTED" if is_positive else "NORMAL",
+        "votes_positive": votes_positive,
+        "votes_total": votes_total,
+        "components": components,
+    }
+
+
+# =========================
+# STAGE 2: CAP SEVERITY (NSCAP / SCAP)
+# =========================
+SEVERITY_INFO = {
+    "NSCAP": {
+        "full_name": "Non-Severe Community-Acquired Pneumonia",
+        "description": (
+            "The combined signals (CRP, X-ray involvement extent, and vitals/labs, "
+            "whichever were available) are consistent with a milder overall picture. "
+            "Non-severe CAP is typically manageable with standard outpatient "
+            "or general-ward care, though clinical correlation is still required."
+        ),
+    },
+    "SCAP": {
+        "full_name": "Severe Community-Acquired Pneumonia",
+        "description": (
+            "The combined signals (CRP, X-ray involvement extent, and vitals/labs, "
+            "whichever were available) are consistent with a more severe overall picture. "
+            "Severe CAP is associated with a higher-risk clinical course and "
+            "often warrants closer monitoring or escalated (e.g. ICU-level) care."
+        ),
+    },
+}
+
+
+SEVERITY_MODALITY_WEIGHTS = {
+    "crp_model": 0.2,
+    "xray_extent": 0.5,
+    "vitals": 0.3,
+}
+
+VITALS_SEVERITY_THRESHOLDS = {
+    "spo2":        lambda v: v < 92,
+    "pulse_rate":  lambda v: v > 125,
+    "wbc":         lambda v: v < 4000 or v > 20000,
+    "platelet":    lambda v: v < 100,
+    "temperature": lambda v: v < 96.8 or v > 104,
+}
+
+
+def heatmap_hot_fraction(heatmap):
+    h = cv2.resize(heatmap.astype("float32"), (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC)
+    if float(h.max()) <= 1e-6:
+        return 0.0
+    threshold = 0.6 * h.max()
+    return float((h >= threshold).sum()) / h.size
+
+
+def vitals_severity_score(lab_rows):
+    by_label = {row["label"]: row for row in lab_rows}
+    label_for_key = {
+        "spo2": "SpO2", "pulse_rate": "Pulse Rate", "wbc": "WBC",
+        "platelet": "Platelets", "temperature": "Temperature",
+    }
+
+    flagged = 0
+    considered = 0
+    for key, check in VITALS_SEVERITY_THRESHOLDS.items():
+        row = by_label.get(label_for_key[key])
+        if row is None or row["flag"] == "N/A":
+            continue
+        try:
+            value = float(row["value"].rstrip(" *"))
+        except (ValueError, TypeError):
+            continue
+        considered += 1
+        if check(value):
+            flagged += 1
+
+    if considered == 0:
+        return 0.0, 0
+    return flagged / considered, considered
+
+
+def predict_severity(crp_raw, extent_fraction=None, lab_rows=None):
+    components = []
+    crp_val = None
+
+    if crp_model is not None and crp_scaler is not None:
+        crp_str = "" if crp_raw is None else str(crp_raw).strip()
+        if crp_str != "":
+            try:
+                crp_candidate = float(crp_str)
+            except (ValueError, TypeError):
+                crp_candidate = None
+            if crp_candidate is not None and crp_candidate >= 0:
+                try:
+                    X = np.array([[crp_candidate]], dtype="float32")
+                    X_scaled = crp_scaler.transform(X)
+                    prob_scap = float(crp_model.predict(X_scaled, verbose=0).squeeze())
+                    crp_val = crp_candidate
+                    components.append(("CRP severity model", prob_scap, SEVERITY_MODALITY_WEIGHTS["crp_model"]))
+                except Exception as e:
+                    print("CRP severity prediction error:", e)
+
+    if extent_fraction is not None:
+        extent_component = min(1.0, extent_fraction / 0.30)
+        components.append(("X-ray involvement extent", extent_component, SEVERITY_MODALITY_WEIGHTS["xray_extent"]))
+
+    if lab_rows is not None:
+        vitals_component, considered = vitals_severity_score(lab_rows)
+        if considered > 0:
+            components.append(("Vitals severity indicators", vitals_component, SEVERITY_MODALITY_WEIGHTS["vitals"]))
+
+    if not components:
+        return {"available": False, "reason": "No CRP, X-ray extent, or vitals signal was available to stage severity."}
+
+    total_weight = sum(w for _, _, w in components)
+    composite = sum(value * w for _, value, w in components) / total_weight
+
+    is_severe = composite >= 0.5
+    label = "SCAP" if is_severe else "NSCAP"
+    confidence = composite * 100 if is_severe else (1 - composite) * 100
+    meta = SEVERITY_INFO[label]
+
+    breakdown = [
+        {
+            "name": name,
+            "weight_pct": round(100 * w / total_weight, 1),
+            "value_pct": round(value * 100, 1),
+        }
+        for name, value, w in components
+    ]
+
+    return {
+        "available": True,
+        "label": label,
+        "confidence": confidence,
+        "crp_value": crp_val,
+        "full_name": meta["full_name"],
+        "description": meta["description"],
+        "breakdown": breakdown,
+    }
+
+
+def gradcam(model, img_array, layer_name, layer_owner):
+    if model is None or layer_name is None:
+        return np.zeros((IMG_SIZE, IMG_SIZE), dtype="float32")
+
+    try:
+        if not getattr(model, "inputs", None):
+            _ = model(img_array)
+
+        grad_model = tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[layer_owner.get_layer(layer_name).output, model.output]
+        )
+
+        with tf.GradientTape() as tape:
+            conv_out, preds = grad_model(img_array)
+            loss = tf.reduce_max(preds, axis=1)
+
+        grads = tape.gradient(loss, conv_out)
+
+        if grads is None:
+            return np.zeros((IMG_SIZE, IMG_SIZE), dtype="float32")
+
+        pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        conv_out = conv_out[0]
+        heatmap = conv_out @ pooled[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+
+        heatmap = tf.maximum(heatmap, 0)
+        heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-8)
+
+        return heatmap.numpy()
+
+    except Exception as e:
+        print("Grad-CAM error:", e)
+        return np.zeros((IMG_SIZE, IMG_SIZE), dtype="float32")
+
+
+def make_overlay(img, heatmap):
+    heatmap = cv2.resize(heatmap, (IMG_SIZE, IMG_SIZE))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    return cv2.addWeighted(img, 0.6, heatmap, 0.4, 0)
+
+
+def get_bbox_from_heatmap(heatmap, threshold_ratio=0.6, min_area_ratio=0.008):
+    h = cv2.resize(heatmap.astype("float32"), (IMG_SIZE, IMG_SIZE))
+
+    if float(h.max()) <= 1e-6:
+        return None
+
+    thresh_val = threshold_ratio * h.max()
+    mask = (h >= thresh_val).astype("uint8") * 255
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    min_area = min_area_ratio * IMG_SIZE * IMG_SIZE
+    if cv2.contourArea(largest) < min_area:
+        return None
+
+    x, y, w, box_h = cv2.boundingRect(largest)
+
+    pad = 4
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(IMG_SIZE, x + w + pad)
+    y2 = min(IMG_SIZE, y + box_h + pad)
+
+    return (x1, y1, x2, y2)
+
+
+def draw_bbox(img, bbox, color=(0, 255, 255), thickness=2):
+    out = img.copy()
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+    return out
+
+
+def _add_caption(image, text):
+    bar_h = 40
+    canvas = np.zeros((image.shape[0] + bar_h, image.shape[1], 3), dtype=np.uint8)
+    canvas[bar_h:, :, :] = image
+    cv2.putText(
+        canvas, text, (10, 27),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA
+    )
+    return canvas
+
+
+def make_comparison_image(img, heatmap, bbox):
+    img_r = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    overlay = make_overlay(img, heatmap)
+
+    img_boxed = draw_bbox(img_r, bbox)
+    overlay_boxed = draw_bbox(overlay, bbox)
+
+    left = _add_caption(img_boxed, "Original Image")
+    right = _add_caption(overlay_boxed, "Image + Grad-CAM")
+
+    gap = np.zeros((left.shape[0], 10, 3), dtype=np.uint8)
+    combined = np.hstack([left, gap, right])
+    return combined
+
+
+def interpret_heatmap(heatmap, is_positive, bbox=None):
+    try:
+        h = cv2.resize(heatmap.astype("float32"), (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC)
+
+        if float(h.max()) <= 1e-6:
+            return {
+                "intensity": "Not available",
+                "location": "No focal region detected",
+                "note": "Grad-CAM could not generate a reliable attention map for this image."
+            }
+
+        threshold = 0.6 * h.max()
+        hot_fraction = float((h >= threshold).sum()) / h.size
+
+        if hot_fraction < 0.06:
+            intensity = "High & focal"
+            intensity_note = "the model's attention is tightly concentrated in a small region"
+        elif hot_fraction < 0.18:
+            intensity = "Moderate"
+            intensity_note = "the model's attention is moderately concentrated"
+        else:
+            intensity = "Low & diffuse"
+            intensity_note = "the model's attention is spread across a broad area"
+
+        if not is_positive:
+            return {
+                "intensity": "Normal",
+                "location": "No significant abnormal focus",
+                "note": (
+                    "The Grad-CAM visualization shows where the AI model focused while "
+                    "confirming a normal chest X-ray. Highlighted regions represent "
+                    "model attention only and should not be interpreted as disease."
+                )
+            }
+
+        def quadrant_for_point(px, py):
+            half = "upper" if py < h.shape[0] / 2 else "lower"
+            side = "right" if px < h.shape[1] / 2 else "left"
+            return f"{half} zone of the {side} lung field"
+
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            location = quadrant_for_point(cx, cy)
+        else:
+            py, px = np.unravel_index(np.argmax(h), h.shape)
+            location = quadrant_for_point(px, py)
+
+        if is_positive:
+            note = (
+                f"{intensity_note.capitalize()}, concentrated mainly in the {location}. "
+                "This is the region that contributed most to the pneumonia prediction."
+            )
+        else:
+            note = (
+                f"{intensity_note.capitalize()}, with the {location} showing the most (though still low) "
+                "activation. No strong focal abnormality pattern was detected."
+            )
+
+        return {
+            "intensity": intensity,
+            "location": location.capitalize(),
+            "note": note
+        }
+
+    except Exception:
+        return {
+            "intensity": "Not available",
+            "location": "Not available",
+            "note": "Heatmap interpretation could not be generated for this image."
+        }
+
+
+def save_patient(full_name, age, gender):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO patients (full_name, age, gender) VALUES (%s, %s, %s)",
+                (full_name, age, gender)
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
+
+
+def save_report(patient_id, report_code, prediction, confidence, image_name, pdf_path, severity_label=None):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """INSERT INTO diagnosis_reports
+                   (patient_id, report_code, image_name, final_diagnosis, confidence, pdf_path, severity)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (patient_id, report_code, image_name, prediction, confidence, pdf_path, severity_label)
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
+
+
+# =========================
+# AUTO-FILL: remember patient data by X-ray fingerprint
+# =========================
+AUTOFILL_FIELDS = ["patient_name", "age", "gender", "wbc", "rbc", "platelet",
+                   "hb", "temperature", "spo2", "pulse_rate", "crp"]
+_AUTOFILL_COLS = ", ".join(AUTOFILL_FIELDS)
+
+
+def image_hash(file_bytes):
+    """Unique fingerprint of the uploaded X-ray file."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def save_autofill_record(file_bytes, data):
+    """Store (or update) one patient's values, keyed by X-ray fingerprint."""
+    placeholders = ", ".join(["%s"] * (len(AUTOFILL_FIELDS) + 1))
+    updates = ", ".join(f"{f}=VALUES({f})" for f in AUTOFILL_FIELDS)
+    values = [image_hash(file_bytes)] + [str(data.get(f, "") or "") for f in AUTOFILL_FIELDS]
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"INSERT INTO stored_patients (image_hash, {_AUTOFILL_COLS}) VALUES ({placeholders}) "
+                f"ON DUPLICATE KEY UPDATE {updates}",
+                values,
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+    finally:
+        conn.close()
+
+
+@app.post("/lookup")
+async def lookup(file: UploadFile = File(...)):
+    """Called by the browser as soon as an X-ray is dropped on the form."""
+    contents = await file.read()
+    try:
+        conn = get_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(
+                    f"SELECT {_AUTOFILL_COLS} FROM stored_patients WHERE image_hash = %s",
+                    (image_hash(contents),),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"found": row is not None, "data": row}
+
+
+BASE_CSS = """
+:root{
+  --bg-1:#0f172a;
+  --bg-2:#1e293b;
+  --accent:#0ea5e9;
+  --accent-2:#22d3ee;
+  --danger:#ef4444;
+  --success:#10b981;
+  --card:#ffffff;
+  --text-dark:#0f172a;
+  --text-muted:#64748b;
+  --radius:18px;
+}
+
+*{box-sizing:border-box;}
+
+body{
+  margin:0;
+  min-height:100vh;
+  font-family:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(14,165,233,0.18), transparent 45%),
+    radial-gradient(circle at 85% 80%, rgba(34,211,238,0.14), transparent 45%),
+    linear-gradient(160deg, var(--bg-1), var(--bg-2));
+  color:var(--text-dark);
+  padding:36px 18px;
+}
+
+.shell{
+  max-width:1080px;
+  margin:0 auto;
+}
+
+.brand{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:12px;
+  margin-bottom:28px;
+}
+
+.brand .logo{
+  width:46px;height:46px;border-radius:14px;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  display:flex;align-items:center;justify-content:center;
+  font-size:22px;
+  box-shadow:0 8px 20px rgba(14,165,233,0.45);
+}
+
+.brand h1{
+  color:#f8fafc;
+  font-size:22px;
+  font-weight:700;
+  letter-spacing:-0.01em;
+  margin:0;
+}
+.brand span{
+  display:block;
+  color:#94a3b8;
+  font-size:12.5px;
+  font-weight:500;
+  margin-top:2px;
+}
+
+.card{
+  background:var(--card);
+  border-radius:var(--radius);
+  box-shadow:0 25px 60px -15px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.4) inset;
+  overflow:hidden;
+}
+
+.card-pad{ padding:40px; }
+
+@media (max-width:640px){ .card-pad{ padding:24px; } }
+
+.section-label{
+  font-size:14px;
+  font-weight:700;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  color:var(--accent);
+  margin:0 0 16px 0;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.section-label::before{
+  content:"";
+  width:18px;height:2px;
+  background:var(--accent);
+  border-radius:2px;
+}
+
+.field-group{ margin-bottom:28px; }
+
+.grid{ display:grid; gap:16px; }
+.grid-3{ grid-template-columns:repeat(3,1fr); }
+.grid-4{ grid-template-columns:repeat(4,1fr); }
+@media (max-width:640px){ .grid-3,.grid-4{ grid-template-columns:1fr 1fr; } }
+
+label{
+  display:block;
+  font-size:13px;
+  font-weight:700;
+  color:#334155;
+  margin-bottom:6px;
+}
+
+input[type=text], input[type=number], input{
+  width:100%;
+  padding:12px 14px;
+  border:1.5px solid #e2e8f0;
+  border-radius:11px;
+  font-size:14.5px;
+  background:#f8fafc;
+  transition:border-color .15s, box-shadow .15s;
+  font-family:inherit;
+}
+input:focus{
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px rgba(14,165,233,0.12);
+  background:#fff;
+}
+
+.upload-box{
+  border:2px dashed #cbd5e1;
+  border-radius:14px;
+  padding:26px;
+  text-align:center;
+  background:#f8fafc;
+  transition:border-color .15s, background .15s;
+  cursor:pointer;
+}
+.upload-box:hover{ border-color:var(--accent); background:#f0f9ff; }
+.upload-box input[type=file]{
+  border:none; background:none; padding:0; text-align:center;
+}
+.upload-icon{ font-size:30px; margin-bottom:6px; }
+.upload-hint{ font-size:12.5px; color:var(--text-muted); margin-top:6px; }
+
+.btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  width:100%;
+  padding:16px;
+  font-size:15.5px;
+  font-weight:700;
+  border:none;
+  border-radius:13px;
+  cursor:pointer;
+  color:#fff;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  box-shadow:0 12px 24px -8px rgba(14,165,233,0.55);
+  transition:transform .12s, box-shadow .12s;
+}
+.btn:hover{ transform:translateY(-1px); box-shadow:0 16px 28px -8px rgba(14,165,233,0.6); }
+.btn:active{ transform:translateY(0); }
+
+.btn-outline{
+  background:#fff;
+  color:var(--accent);
+  border:1.5px solid var(--accent);
+  box-shadow:none;
+}
+
+.footer-note{
+  text-align:center;
+  color:#94a3b8;
+  font-size:12px;
+  margin-top:22px;
+}
+
+.result-banner{
+  border-radius:16px;
+  padding:28px;
+  text-align:center;
+  margin-bottom:28px;
+}
+.result-banner.positive{ background:linear-gradient(135deg,#fef2f2,#fee2e2); border:1.5px solid #fecaca; }
+.result-banner.negative{ background:linear-gradient(135deg,#f0fdf4,#dcfce7); border:1.5px solid #bbf7d0; }
+
+.result-banner h2{
+  margin:0 0 6px 0;
+  font-size:24px;
+  letter-spacing:-0.01em;
+}
+.result-banner.positive h2{ color:#b91c1c; }
+.result-banner.negative h2{ color:#15803d; }
+
+.result-banner .conf{
+  font-size:14px;
+  color:#475569;
+  font-weight:600;
+}
+
+.confidence-bar{
+  width:100%;
+  height:10px;
+  border-radius:6px;
+  background:#e2e8f0;
+  margin-top:14px;
+  overflow:hidden;
+}
+.confidence-fill{
+  height:100%;
+  border-radius:6px;
+}
+.confidence-fill.positive{ background:linear-gradient(90deg,#f87171,#ef4444); }
+.confidence-fill.negative{ background:linear-gradient(90deg,#34d399,#10b981); }
+
+.severity-banner{
+  border-radius:16px;
+  padding:24px 26px;
+  margin-bottom:28px;
+}
+.severity-banner.scap{ background:linear-gradient(135deg,#fef2f2,#fee2e2); border:1.5px solid #fecaca; }
+.severity-banner.nscap{ background:linear-gradient(135deg,#fffbeb,#fef3c7); border:1.5px solid #fde68a; }
+.severity-banner.unavailable{ background:#f8fafc; border:1.5px dashed #cbd5e1; }
+
+.severity-banner .sev-top{
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-bottom:6px;
+}
+.severity-banner h3{
+  margin:0;
+  font-size:19px;
+  letter-spacing:-0.01em;
+}
+.severity-banner.scap h3{ color:#b91c1c; }
+.severity-banner.nscap h3{ color:#b45309; }
+.severity-banner.unavailable h3{ color:#64748b; }
+
+.severity-banner .sev-conf{
+  font-size:13px;
+  font-weight:700;
+  color:#475569;
+}
+.severity-banner .sev-full{
+  font-size:13px;
+  color:#475569;
+  font-weight:600;
+  margin-bottom:10px;
+}
+.severity-banner .sev-desc{
+  font-size:13.5px;
+  color:#334155;
+  line-height:1.6;
+}
+.severity-crp-badge{
+  display:inline-block;
+  margin-top:12px;
+  padding:5px 12px;
+  border-radius:999px;
+  background:rgba(255,255,255,0.6);
+  border:1px solid rgba(0,0,0,0.06);
+  font-size:12px;
+  font-weight:700;
+  color:#334155;
+}
+
+.sev-breakdown{
+  margin-top:14px;
+  padding-top:12px;
+  border-top:1px solid rgba(0,0,0,0.08);
+}
+.sev-breakdown-label{
+  font-size:11.5px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:0.04em;
+  color:#64748b;
+  margin-bottom:8px;
+}
+.sev-breakdown-row{
+  display:grid;
+  grid-template-columns:150px 1fr 150px;
+  align-items:center;
+  gap:10px;
+  margin-bottom:6px;
+}
+@media (max-width:640px){
+  .sev-breakdown-row{ grid-template-columns:1fr; gap:3px; }
+}
+.sev-breakdown-name{
+  font-size:12px;
+  font-weight:700;
+  color:#334155;
+}
+.sev-breakdown-bar{
+  height:8px;
+  border-radius:4px;
+  background:rgba(0,0,0,0.08);
+  overflow:hidden;
+  display:block;
+}
+.sev-breakdown-bar span{
+  display:block;
+  height:100%;
+  border-radius:4px;
+  background:currentColor;
+  color:#0ea5e9;
+}
+.sev-breakdown-val{
+  font-size:11px;
+  color:#64748b;
+  text-align:right;
+}
+@media (max-width:640px){ .sev-breakdown-val{ text-align:left; } }
+
+.stage1-card{
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  border-radius:14px;
+  padding:18px 20px;
+  margin-bottom:28px;
+}
+.stage1-card h4{
+  margin:0 0 4px 0;
+  font-size:13px;
+  letter-spacing:0.04em;
+  text-transform:uppercase;
+  color:var(--accent);
+}
+.stage1-vote-line{
+  font-size:12.5px;
+  color:#64748b;
+  margin-bottom:12px;
+}
+.stage1-row{
+  display:grid;
+  grid-template-columns:130px 110px 1fr;
+  align-items:center;
+  gap:10px;
+  padding:9px 0;
+  border-top:1px solid #e2e8f0;
+}
+.stage1-row:first-of-type{ border-top:none; }
+@media (max-width:560px){
+  .stage1-row{ grid-template-columns:1fr; gap:2px; }
+}
+.stage1-name{
+  font-size:12.5px;
+  font-weight:700;
+  color:#334155;
+}
+.stage1-pill{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:11px;
+  font-weight:700;
+  width:fit-content;
+}
+.stage1-pill.pos{ background:#fee2e2; color:#b91c1c; }
+.stage1-pill.neg{ background:#dcfce7; color:#15803d; }
+.stage1-pill.na{ background:#e2e8f0; color:#64748b; }
+.stage1-detail{
+  font-size:12px;
+  color:#64748b;
+}
+
+.info-note{
+  border-radius:14px;
+  padding:18px 20px;
+  margin-bottom:28px;
+  border:1.5px solid #fde68a;
+  background:linear-gradient(135deg,#fffbeb,#fef3c7);
+}
+.info-note h4{
+  margin:0 0 6px 0;
+  font-size:14px;
+  color:#b45309;
+}
+.info-note p{
+  margin:0;
+  font-size:13px;
+  color:#334155;
+  line-height:1.6;
+}
+.glossary-card{
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  border-radius:14px;
+  padding:18px 20px;
+  margin-bottom:28px;
+}
+.glossary-card h4{
+  margin:0 0 10px 0;
+  font-size:13px;
+  letter-spacing:0.04em;
+  text-transform:uppercase;
+  color:var(--accent);
+}
+.glossary-card dl{ margin:0; }
+.glossary-card dt{
+  font-size:13.5px;
+  font-weight:700;
+  color:#0f172a;
+  margin-top:10px;
+}
+.glossary-card dt:first-child{ margin-top:0; }
+.glossary-card dd{
+  margin:2px 0 0 0;
+  font-size:13px;
+  color:#334155;
+  line-height:1.6;
+}
+
+.image-panel{
+  background:#0f172a;
+  border-radius:16px;
+  padding:18px;
+  text-align:center;
+  margin-bottom:28px;
+}
+.image-panel img{
+  max-width:100%;
+  border-radius:10px;
+  box-shadow:0 8px 30px rgba(0,0,0,0.4);
+}
+.image-panel .cap{
+  color:#94a3b8;
+  font-size:12px;
+  margin-top:10px;
+  letter-spacing:0.03em;
+}
+
+.interp-card{
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  border-radius:14px;
+  padding:18px 20px;
+  margin-bottom:28px;
+}
+.interp-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:14px;
+  margin-bottom:14px;
+}
+@media (max-width:520px){ .interp-grid{ grid-template-columns:1fr; } }
+.interp-tile .k{
+  font-size:11px;
+  color:var(--text-muted);
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+}
+.interp-tile .v{
+  font-size:15.5px;
+  font-weight:700;
+  color:var(--text-dark);
+  margin-top:4px;
+}
+.interp-note{
+  font-size:13px;
+  color:#334155;
+  line-height:1.6;
+  padding-top:12px;
+  border-top:1px solid #e2e8f0;
+}
+
+.info-grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:14px;
+  margin-bottom:28px;
+}
+@media (max-width:640px){ .info-grid{ grid-template-columns:1fr 1fr; } }
+
+.info-tile{
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  border-radius:12px;
+  padding:14px 16px;
+}
+.info-tile .k{ font-size:11px; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:0.05em; }
+.info-tile .v{ font-size:16px; font-weight:700; color:var(--text-dark); margin-top:3px; }
+
+.lab-card{
+  background:#fff;
+  border:1px solid #e2e8f0;
+  border-radius:14px;
+  overflow:hidden;
+  margin-bottom:28px;
+}
+.lab-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:13.5px;
+}
+.lab-table thead th{
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  color:#fff;
+  text-align:left;
+  padding:12px 14px;
+  font-size:11.5px;
+  letter-spacing:0.04em;
+  text-transform:uppercase;
+}
+.lab-table tbody td{
+  padding:11px 14px;
+  border-bottom:1px solid #f1f5f9;
+  color:#0f172a;
+}
+.lab-table tbody tr:last-child td{ border-bottom:none; }
+.lab-table tbody tr:nth-child(even){ background:#f8fafc; }
+.lab-table .range-col{ color:var(--text-muted); }
+.flag-pill{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:11.5px;
+  font-weight:700;
+}
+.flag-pill.Normal{ background:#dcfce7; color:#15803d; }
+.flag-pill.Low{ background:#fef3c7; color:#b45309; }
+.flag-pill.High{ background:#fee2e2; color:#b91c1c; }
+.flag-pill.NA{ background:#e2e8f0; color:#64748b; }
+
+.actions{
+  display:flex;
+  gap:12px;
+  justify-content:center;
+  align-items:center;
+  margin-top:10px;
+}
+
+.actions .btn{
+  width:auto;
+  min-width:160px;
+  text-decoration:none;
+  text-align:center;
+}
+
+.actions .btn-outline{
+  background:#fff;
+  color:var(--accent);
+  border:1.5px solid var(--accent);
+  box-shadow:none;
+}
+
+.actions .btn-outline:hover{
+  background:var(--accent);
+  color:#fff;
+  transform:translateY(-1px);
+  box-shadow:0 8px 18px rgba(14,165,233,0.25);
+}
+
+@media (max-width:520px){
+  .actions{
+    flex-direction:column;
+  }
+
+  .actions .btn{
+    width:100%;
+  }
+}
+
+.disclaimer{
+  margin-top:26px;
+  font-size:12px;
+  color:#94a3b8;
+  text-align:center;
+  line-height:1.6;
+}
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pneumonia Detection System &middot; X-Ray Screening</title>
+<style>{BASE_CSS}</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <div class="brand">
+    <div class="logo">🫁</div>
+    <h1>Pneumonia Detection System
+      <span>Chest X-Ray Pneumonia Screening &amp; Report Generator</span>
+    </h1>
+  </div>
+
+  <div class="card">
+    <div class="card-pad">
+
+      <form action="/predict" method="post" enctype="multipart/form-data">
+
+        <div class="field-group">
+          <p class="section-label">Patient Information</p>
+          <div class="grid grid-3">
+            <div>
+              <label>Patient Name</label>
+              <input type="text" name="patient_name" placeholder="e.g. John Carter" required>
+            </div>
+            <div>
+              <label>Age</label>
+              <input type="number" name="age" placeholder="e.g. 34" required>
+            </div>
+            <div>
+              <label>Gender</label>
+              <input type="text" name="gender" placeholder="Male / Female / Other" required>
+            </div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <p class="section-label">Chest X-Ray Image</p>
+          <div class="upload-box">
+            <div class="upload-icon">📤</div>
+            <input type="file" name="file" accept="image/*" required>
+            <div class="upload-hint">JPG or PNG &middot; the image will be analyzed by the AI model</div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <p class="section-label">Lab Values <span style="text-transform:none;font-weight:500;font-size:12px;color:#94a3b8;"></span></p>
+          <div class="grid grid-4">
+            <div>
+              <label>WBC (cells/µL)</label>
+              <input type="text" name="wbc" placeholder="e.g. 8200">
+            </div>
+            <div>
+              <label>RBC (mill/µL)</label>
+              <input type="text" name="rbc" placeholder="e.g. 4.8">
+            </div>
+            <div>
+              <label>Platelets (×10³/µL)</label>
+              <input type="text" name="platelet" placeholder="e.g. 250">
+            </div>
+            <div>
+              <label>Hemoglobin (g/dL)</label>
+              <input type="text" name="hb" placeholder="e.g. 13.5">
+            </div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <p class="section-label">Vitals <span style="text-transform:none;font-weight:500;font-size:12px;color:#94a3b8;"></span></p>
+          <div class="grid grid-3">
+            <div>
+              <label>Temperature (°F)</label>
+              <input type="text" name="temperature" placeholder="e.g. 98.6">
+            </div>
+            <div>
+              <label>SpO2 (%)</label>
+              <input type="text" name="spo2" placeholder="e.g. 97">
+            </div>
+            <div>
+              <label>Pulse Rate (bpm)</label>
+              <input type="text" name="pulse_rate" placeholder="e.g. 78">
+            </div>
+          </div>
+        </div>
+
+      <div class="field-group">
+    <p class="section-label">CAP Severity Assessment</p>
+
+    <div class="grid grid-3">
+        <div>
+            <label>CRP (mg/L)</label>
+            <input type="text" name="crp" placeholder="e.g. 24.5">
+        </div>
+    </div>
+
+    <div class="upload-hint" style="margin-top:8px;">
+        Used as one of the clinical parameters for CAP severity assessment
+        after pneumonia is detected.
+    </div>
+</div>
+
+        <label style="display:flex;gap:8px;align-items:center;font-weight:600;margin-bottom:18px;">
+          <input type="checkbox" name="save_for_autofill" value="1" style="width:auto;">
+          Remember this patient (auto-fill when this X-ray is uploaded again)
+        </label>
+
+        <button class="btn" type="submit"> Analyze &amp; Generate Report</button>
+
+      </form>
+
+    </div>
+  </div>
+
+  <div style="max-width:1080px;margin:18px auto 0 auto;">
+    <a href="/history" class="btn btn-outline" style="display:flex;"> Stored Records</a>
+  </div>
+  <p class="footer-note">For clinical decision support only &middot; not a substitute for radiologist review</p>
+
+</div>
+
+<script src="/assets/autofill.js"></script>
+</body>
+</html>
+"""
+
+
+def build_glossary_html():
+    nscap = SEVERITY_INFO["NSCAP"]
+    scap = SEVERITY_INFO["SCAP"]
+    return f"""
+      <div class="glossary-card">
+        <h4>About CAP Severity Staging (NSCAP / SCAP)</h4>
+        <p style="font-size:12.5px;color:#64748b;margin:0 0 12px 0;line-height:1.6;">
+          Staging is a weighted composite of up to three signals when a case is positive for
+          pneumonia: the CRP severity model, how much of the lung field Grad-CAM flagged as
+          involved on the X-ray, and how many entered vitals/labs fall outside a
+          severity-relevant range. It is not based on CRP alone.
+        </p>
+        <dl>
+          <dt>NSCAP &mdash; {nscap['full_name']}</dt>
+          <dd>{nscap['description']}</dd>
+          <dt>SCAP &mdash; {scap['full_name']}</dt>
+          <dd>{scap['description']}</dd>
+        </dl>
+      </div>"""
+
+
+def build_stage1_html(stage1_result):
+    rows = ""
+    for c in stage1_result["components"]:
+        if not c["available"]:
+            pill_class, pill_text = "na", "Not assessed"
+        elif c["is_positive"]:
+            pill_class, pill_text = "pos", c["result"]
+        else:
+            pill_class, pill_text = "neg", c["result"]
+        rows += f"""
+        <div class="stage1-row">
+          <span class="stage1-name">{html.escape(c['name'])}</span>
+          <span class="stage1-pill {pill_class}">{html.escape(pill_text)}</span>
+          <span class="stage1-detail">{html.escape(c['detail'])}</span>
+        </div>"""
+
+    return f"""
+      <div class="stage1-card">
+        <h4>Stage 1 &middot; Multimodal Screening</h4>
+        <div class="stage1-vote-line">
+          {stage1_result['votes_positive']} of {stage1_result['votes_total']} available signal(s) voted Positive &middot;
+          final call by majority vote: <strong>{stage1_result['label']}</strong>
+        </div>
+        {rows}
+      </div>"""
+
+
+def build_crp_high_normal_note_html(crp_row, is_positive):
+    if is_positive or not crp_row or crp_row.get("flag") != "High":
+        return ""
+    return f"""
+      <div class="info-note">
+        <h4>⚠ Elevated CRP Despite Normal X-Ray</h4>
+        <p>
+          The chest X-ray was read as NORMAL by the AI model, but the entered CRP
+          ({crp_row['value']} {crp_row['unit']}) is above the standard reference range.
+          CRP is a general marker of inflammation in the body and can be elevated for many
+          reasons unrelated to the lungs (other infections, injury, autoimmune conditions,
+          etc.), so this does not itself indicate pneumonia and NSCAP/SCAP staging is not
+          run on a NORMAL result. Please correlate with clinical findings and consider
+          further evaluation if elevated CRP is otherwise unexplained.
+        </p>
+      </div>"""
+
+
+@app.post("/predict", response_class=HTMLResponse)
+async def predict(
+    patient_name: str = Form(...),
+    age: str = Form(...),
+    gender: str = Form(...),
+    wbc: str = Form(""),
+    rbc: str = Form(""),
+    platelet: str = Form(""),
+    hb: str = Form(""),
+    temperature: str = Form(""),
+    spo2: str = Form(""),
+    pulse_rate: str = Form(""),
+    crp: str = Form(""),
+    save_for_autofill: str = Form(""),
+    file: UploadFile = File(...)
+):
+    try:
+        if model is None:
+            return HTMLResponse("<h2>Model not loaded</h2>")
+
+        cleanup_old_files("static")
+        cleanup_old_files("reports")
+        cleanup_stale_pdf_store_entries()
+
+        patient_name_safe = html.escape(patient_name)
+        age_safe = html.escape(age)
+        gender_safe = html.escape(gender)
+
+        contents = await file.read()
+
+        # AUTO-FILL: remember this patient if the checkbox was ticked
+        if save_for_autofill:
+            try:
+                save_autofill_record(contents, {
+                    "patient_name": patient_name, "age": age, "gender": gender,
+                    "wbc": wbc, "rbc": rbc, "platelet": platelet, "hb": hb,
+                    "temperature": temperature, "spo2": spo2,
+                    "pulse_rate": pulse_rate, "crp": crp,
+                })
+            except Exception as autofill_err:
+                print("Autofill save error:", autofill_err)
+
+        img, img_array = preprocess(contents)
+
+        pred = model.predict(img_array)
+        raw_prob = float(pred.squeeze())
+
+        pneumonia_prob = raw_prob if POSITIVE_CLASS_IS_PNEUMONIA_WHEN_PROB_HIGH else (1 - raw_prob)
+        print(f"[predict] raw_model_output={raw_prob:.4f}  pneumonia_prob={pneumonia_prob:.4f}  "
+              f"polarity_flag={POSITIVE_CLASS_IS_PNEUMONIA_WHEN_PROB_HIGH}")
+
+        cnn_is_positive = pneumonia_prob > 0.5
+        confidence = pneumonia_prob * 100 if cnn_is_positive else (1 - pneumonia_prob) * 100
+
+        blood_result = predict_blood_ann(age, hb, platelet, wbc, rbc)
+        oxygen_result = predict_oxygen_ann(spo2, pulse_rate, temperature)
+        stage1_result = combine_stage1(cnn_is_positive, confidence, blood_result, oxygen_result)
+
+        is_positive = stage1_result["is_positive"]
+        label = stage1_result["label"]
+        result_class = "positive" if is_positive else "negative"
+        stage1_html = build_stage1_html(stage1_result)
+
+        last_conv, layer_owner = get_last_conv(model)
+        heatmap = gradcam(model, img_array, last_conv, layer_owner)
+
+        bbox = get_bbox_from_heatmap(heatmap) if is_positive else None
+        region_localized = bbox is not None
+
+        heatmap_info = interpret_heatmap(heatmap, is_positive, bbox)
+
+        if is_positive:
+            comparison_img = make_comparison_image(img, heatmap, bbox)
+        else:
+            img_r = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            comparison_img = _add_caption(img_r, "Original Image")
+
+        img_name = f"{uuid.uuid4().hex}.jpg"
+        cv2.imwrite(f"static/{img_name}", comparison_img)
+
+        report_id = uuid.uuid4().hex[:10].upper()
+        timestamp = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+        vitals = {
+            "wbc": wbc, "rbc": rbc, "platelet": platelet, "hb": hb,
+            "temperature": temperature, "spo2": spo2, "pulse_rate": pulse_rate,
+            "crp": crp
+        }
+        lab_rows = evaluate_all_vitals(vitals)
+
+        extent_fraction = heatmap_hot_fraction(heatmap) if is_positive else None
+        severity_info = predict_severity(crp, extent_fraction, lab_rows) if is_positive else None
+
+        lab_rows_html = "".join(
+            f"""<tr>
+                <td>{r['label']}</td>
+                <td><strong>{r['value']}</strong></td>
+                <td class="range-col">{r['unit']}</td>
+                <td class="range-col">{r['range']}</td>
+                <td><span class="flag-pill {r['flag'].replace('/', '')}">{r['flag']}</span></td>
+            </tr>"""
+            for r in lab_rows
+        )
+        unit_warnings = [r for r in lab_rows if r.get("unit_warning")]
+        unit_warning_html = ""
+        if unit_warnings:
+            items = "".join(
+                f"<li>{r['label']}: value {r['unit_warning']}</li>" for r in unit_warnings
+            )
+            unit_warning_html = f"""
+            <p style="font-size:12px;color:#b45309;margin-top:-18px;margin-bottom:28px;">
+              ⚠ Some entered values looked like they were in the wrong unit and were
+              auto-converted before flagging: <ul style="margin:4px 0 0 18px;padding:0;">{items}</ul>
+              Please double-check the original entry.
+            </p>"""
+
+        crp_row = next((r for r in lab_rows if r["label"] == "CRP"), None)
+
+        severity_html = ""
+        if is_positive:
+            if severity_info and severity_info["available"]:
+                sev_class = "scap" if severity_info["label"] == "SCAP" else "nscap"
+                crp_badge_html = (
+                    f'<span class="severity-crp-badge">CRP entered: {severity_info["crp_value"]:g} mg/L</span>'
+                    if severity_info.get("crp_value") is not None else ""
+                )
+                breakdown_rows = "".join(
+                    f"""<div class="sev-breakdown-row">
+                        <span class="sev-breakdown-name">{html.escape(b['name'])}</span>
+                        <span class="sev-breakdown-bar"><span style="width:{b['value_pct']:.0f}%;"></span></span>
+                        <span class="sev-breakdown-val">{b['value_pct']:.0f}% &middot; weight {b['weight_pct']:.0f}%</span>
+                    </div>"""
+                    for b in severity_info.get("breakdown", [])
+                )
+                severity_html = f"""
+      <div class="severity-banner {sev_class}">
+        <div class="sev-top">
+          <h3>CAP Severity: {severity_info['label']}</h3>
+          <span class="sev-conf">Composite Confidence: {severity_info['confidence']:.2f}%</span>
+        </div>
+        <div class="sev-full">{severity_info['full_name']}</div>
+        <div class="sev-desc">{severity_info['description']}</div>
+        <div class="sev-breakdown">
+          <div class="sev-breakdown-label">Based on {len(severity_info.get('breakdown', []))} combined signal(s), not CRP alone:</div>
+          {breakdown_rows}
+        </div>
+        {crp_badge_html}
+      </div>"""
+            else:
+                reason = html.escape(severity_info["reason"]) if severity_info else "Severity model unavailable."
+                severity_html = f"""
+      <div class="severity-banner unavailable">
+        <div class="sev-top"><h3>CAP Severity: Not Assessed</h3></div>
+        <div class="sev-desc">{reason}</div>
+      </div>"""
+
+        crp_high_normal_note_html = build_crp_high_normal_note_html(crp_row, is_positive)
+
+        glossary_html = build_glossary_html()
+
+        image_caption = (
+            "Yellow box marks the localized infected/abnormal region • Red/Yellow heatmap shows where the model focused."
+            if is_positive
+            else "Original Chest X-ray (Grad-CAM hidden because no abnormal region was detected)."
+        )
+
+        pdf_path = build_pdf_report(
+            report_id=report_id,
+            timestamp=timestamp,
+            patient_name=patient_name,
+            age=age,
+            gender=gender,
+            label=label,
+            confidence=confidence,
+            is_positive=is_positive,
+            image_path=f"static/{img_name}",
+            image_shape=comparison_img.shape,
+            vitals=vitals,
+            lab_rows=lab_rows,
+            heatmap_info=heatmap_info,
+            region_localized=region_localized,
+            severity_info=severity_info,
+            crp_row=crp_row,
+            stage1_result=stage1_result
+        )
+        PDF_STORE[report_id] = pdf_path
+
+        try:
+            age_for_db = int(age)
+        except (TypeError, ValueError):
+            age_for_db = None
+
+        try:
+            patient_id = save_patient(patient_name, age_for_db, gender)
+            save_report(
+                patient_id=patient_id,
+                report_code=report_id,
+                prediction=label,
+                confidence=round(confidence, 2),
+                image_name=img_name,
+                pdf_path=pdf_path,
+                severity_label=(severity_info["label"] if severity_info and severity_info["available"] else None)
+            )
+        except Exception as db_err:
+            print("DB save error:", db_err)
+
+        return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Report Result &middot; Pneumonia Detection System</title>
+<style>{BASE_CSS}</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <div class="brand">
+    <div class="logo">🫁</div>
+    <h1>Pneumonia Detection System
+      <span>Analysis Result &middot; Report #{report_id}</span>
+    </h1>
+  </div>
+
+  <div class="card">
+    <div class="card-pad">
+
+      <div class="result-banner {result_class}">
+        <h2>{label}</h2>
+        <div class="conf">Model Confidence: {confidence:.2f}%</div>
+        <div class="confidence-bar">
+          <div class="confidence-fill {result_class}" style="width:{confidence:.1f}%;"></div>
+        </div>
+      </div>
+      {stage1_html}
+      {severity_html}
+      {crp_high_normal_note_html}
+
+      <div class="info-grid">
+        <div class="info-tile"><div class="k">Patient</div><div class="v">{patient_name_safe}</div></div>
+        <div class="info-tile"><div class="k">Age / Gender</div><div class="v">{age_safe} / {gender_safe}</div></div>
+        <div class="info-tile"><div class="k">Scan Date</div><div class="v">{timestamp}</div></div>
+      </div>
+
+      <div class="lab-card">
+        <table class="lab-table">
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Result</th>
+              <th>Unit</th>
+              <th>Normal Range</th>
+              <th>Flag</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lab_rows_html}
+          </tbody>
+        </table>
+      </div>
+      {unit_warning_html}
+
+      <div class="image-panel">
+        <img src="/static/{img_name}" alt="X-Ray with Grad-CAM heatmap and infected region box">
+        <div class="cap">{image_caption}</div>
+      </div>
+
+      <div class="interp-card">
+        <div class="interp-grid">
+          <div class="interp-tile"><div class="k">Attention Intensity</div><div class="v">{heatmap_info['intensity']}</div></div>
+          <div class="interp-tile"><div class="k">Region of Focus</div><div class="v">{heatmap_info['location']}</div></div>
+        </div>
+        <div class="interp-note">{heatmap_info['note']}</div>
+      </div>
+
+      {glossary_html}
+
+      <div class="actions">
+        <a href="/download?report_id={report_id}" class="btn">⬇ Download PDF Report</a>
+        <a href="/" class="btn btn-outline"> Go to Home</a>
+      </div>
+
+      <p class="disclaimer">
+        This report is generated by an AI-assisted screening tool and is intended to support,
+        not replace, evaluation by a qualified radiologist or physician. Confidence scores reflect
+        model certainty, not clinical certainty. CAP severity staging (NSCAP/SCAP) is based on a
+        composite of CRP, X-ray involvement extent, and entered vitals/labs, and does not
+        replace a full clinical severity assessment.
+      </p>
+
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
+"""
+
+    except Exception:
+        traceback.print_exc()
+        return HTMLResponse(
+            "<h2>Something went wrong while generating the report.</h2>"
+            "<p>Please try again. If the problem persists, contact support.</p>",
+            status_code=500
+        )
+
+
+def build_pdf_report(report_id, timestamp, patient_name, age, gender,
+                     label, confidence, is_positive, image_path, image_shape,
+                     vitals, lab_rows, heatmap_info, region_localized,
+                     severity_info=None, crp_row=None, stage1_result=None):
+
+    pdf_path = f"reports/report_{report_id}.pdf"
+
+    doc = SimpleDocTemplate(
+        pdf_path, pagesize=A4,
+        topMargin=18 * mm, bottomMargin=18 * mm,
+        leftMargin=18 * mm, rightMargin=18 * mm
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "TitleStyle", parent=styles["Title"],
+        fontSize=20, textColor=colors.HexColor("#0f172a"),
+        alignment=TA_LEFT, spaceAfter=2
+    )
+    sub_style = ParagraphStyle(
+        "SubStyle", parent=styles["Normal"],
+        fontSize=10, textColor=colors.HexColor("#64748b"),
+        alignment=TA_LEFT
+    )
+    section_style = ParagraphStyle(
+        "SectionStyle", parent=styles["Heading2"],
+        fontSize=12.5, textColor=colors.HexColor("#0ea5e9"),
+        spaceBefore=14, spaceAfter=8
+    )
+    normal_style = ParagraphStyle(
+        "NormalStyle", parent=styles["Normal"],
+        fontSize=10.5, leading=15
+    )
+    result_style = ParagraphStyle(
+        "ResultStyle", parent=styles["Normal"],
+        fontSize=16, leading=20, alignment=TA_CENTER,
+        textColor=colors.HexColor("#b91c1c") if is_positive else colors.HexColor("#15803d"),
+        fontName="Helvetica-Bold"
+    )
+    conf_style = ParagraphStyle(
+        "ConfStyle", parent=styles["Normal"],
+        fontSize=10.5, alignment=TA_CENTER,
+        textColor=colors.HexColor("#475569")
+    )
+    disclaimer_style = ParagraphStyle(
+        "DisclaimerStyle", parent=styles["Normal"],
+        fontSize=8, textColor=colors.HexColor("#94a3b8"),
+        alignment=TA_CENTER, leading=11
+    )
+
+    content = []
+
+    header_table = Table(
+        [[Paragraph("Pneumonia Detection System", title_style), Paragraph(f"Report ID: {report_id}<br/>{timestamp}", sub_style)]],
+        colWidths=[110 * mm, 60 * mm]
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+    ]))
+    content.append(header_table)
+    content.append(Paragraph("AI-Assisted Chest X-Ray Screening Report", sub_style))
+    content.append(Spacer(1, 6))
+    content.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#0ea5e9")))
+    content.append(Spacer(1, 14))
+
+    content.append(Paragraph("PATIENT INFORMATION", section_style))
+    patient_table = Table(
+        [
+            ["Name", patient_name, "Age", age],
+            ["Gender", gender, "Report Date", timestamp],
+        ],
+        colWidths=[28 * mm, 57 * mm, 28 * mm, 57 * mm]
+    )
+    patient_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#64748b")),
+        ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#64748b")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    content.append(patient_table)
+    content.append(Spacer(1, 10))
+
+    content.append(Paragraph("VITALS &amp; LAB VALUES", section_style))
+
+    flag_colors = {
+        "Normal": colors.HexColor("#15803d"),
+        "Low": colors.HexColor("#b45309"),
+        "High": colors.HexColor("#b91c1c"),
+        "N/A": colors.HexColor("#94a3b8"),
+    }
+
+    lab_header_style = ParagraphStyle(
+        "LabHeaderStyle", parent=styles["Normal"],
+        fontSize=9, textColor=colors.white, fontName="Helvetica-Bold"
+    )
+    lab_cell_style = ParagraphStyle(
+        "LabCellStyle", parent=styles["Normal"],
+        fontSize=9.5, textColor=colors.HexColor("#0f172a")
+    )
+
+    lab_table_data = [[
+        Paragraph("TEST", lab_header_style),
+        Paragraph("RESULT", lab_header_style),
+        Paragraph("UNIT", lab_header_style),
+        Paragraph("NORMAL RANGE", lab_header_style),
+        Paragraph("FLAG", lab_header_style),
+    ]]
+
+    for i, row in enumerate(lab_rows):
+        flag_style = ParagraphStyle(
+            f"FlagStyle{i}", parent=styles["Normal"],
+            fontSize=9.5, fontName="Helvetica-Bold",
+            textColor=flag_colors.get(row["flag"], colors.HexColor("#0f172a"))
+        )
+        lab_table_data.append([
+            Paragraph(row["label"], lab_cell_style),
+            Paragraph(row["value"], lab_cell_style),
+            Paragraph(row["unit"], lab_cell_style),
+            Paragraph(row["range"], lab_cell_style),
+            Paragraph(row["flag"], flag_style),
+        ])
+
+    lab_table = Table(
+        lab_table_data,
+        colWidths=[38 * mm, 28 * mm, 28 * mm, 40 * mm, 36 * mm]
+    )
+
+    lab_style_cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0ea5e9")),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 1), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.5, colors.HexColor("#e2e8f0")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+    ]
+    lab_table.setStyle(TableStyle(lab_style_cmds))
+    content.append(lab_table)
+    content.append(Spacer(1, 4))
+    content.append(Paragraph(
+        "Reference ranges shown are standard adult values and may vary slightly by laboratory and patient context.",
+        ParagraphStyle("RangeNote", parent=styles["Normal"], fontSize=7.5,
+                        textColor=colors.HexColor("#94a3b8"))
+    ))
+    content.append(Spacer(1, 10))
+
+    if stage1_result is not None:
+        content.append(Paragraph("STAGE 1 &middot; MULTIMODAL SCREENING", section_style))
+
+        stage1_label_style = ParagraphStyle(
+            "Stage1LabelStyle", parent=styles["Normal"],
+            fontSize=9.5, leading=14, textColor=colors.HexColor("#334155")
+        )
+        stage1_row_style = ParagraphStyle(
+            "Stage1RowStyle", parent=styles["Normal"],
+            fontSize=9, leading=13, textColor=colors.HexColor("#0f172a")
+        )
+
+        stage1_intro = (
+            f"{stage1_result['votes_positive']} of {stage1_result['votes_total']} available signal(s) "
+            f"voted Positive &mdash; final call by majority vote: <b>{stage1_result['label']}</b>"
+        )
+
+        stage1_table_data = [[
+            Paragraph("SIGNAL", lab_header_style),
+            Paragraph("RESULT", lab_header_style),
+            Paragraph("DETAIL", lab_header_style),
+        ]]
+        for c in stage1_result["components"]:
+            if not c["available"]:
+                result_color = colors.HexColor("#94a3b8")
+            elif c["is_positive"]:
+                result_color = colors.HexColor("#b91c1c")
+            else:
+                result_color = colors.HexColor("#15803d")
+            result_style_row = ParagraphStyle(
+                f"Stage1ResultStyle{c['name']}", parent=styles["Normal"],
+                fontSize=9, fontName="Helvetica-Bold", textColor=result_color
+            )
+            stage1_table_data.append([
+                Paragraph(c["name"], stage1_row_style),
+                Paragraph(c["result"], result_style_row),
+                Paragraph(c["detail"] or "-", stage1_row_style),
+            ])
+
+        stage1_table = Table(stage1_table_data, colWidths=[40 * mm, 45 * mm, 85 * mm])
+        stage1_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0ea5e9")),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("LINEBELOW", (0, 0), (-1, -2), 0.5, colors.HexColor("#e2e8f0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ]))
+
+        content.append(Paragraph(stage1_intro, stage1_label_style))
+        content.append(Spacer(1, 6))
+        content.append(stage1_table)
+        content.append(Spacer(1, 14))
+
+    content.append(Paragraph("AI SCREENING RESULT", section_style))
+
+    result_box_color = colors.HexColor("#fef2f2") if is_positive else colors.HexColor("#f0fdf4")
+    result_border_color = colors.HexColor("#fecaca") if is_positive else colors.HexColor("#bbf7d0")
+
+    result_inner = Table(
+        [[Paragraph(label, result_style)],
+         [Paragraph(f"Model Confidence: {confidence:.2f}%", conf_style)]],
+        colWidths=[170 * mm]
+    )
+    result_inner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), result_box_color),
+        ("BOX", (0, 0), (-1, -1), 1, result_border_color),
+        ("TOPPADDING", (0, 0), (-1, 0), 14),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 14),
+    ]))
+    content.append(result_inner)
+    content.append(Spacer(1, 14))
+
+    if is_positive:
+        content.append(Paragraph("CAP SEVERITY ASSESSMENT", section_style))
+
+        if severity_info and severity_info["available"]:
+            sev_is_severe = severity_info["label"] == "SCAP"
+            sev_box_color = colors.HexColor("#fef2f2") if sev_is_severe else colors.HexColor("#fffbeb")
+            sev_border_color = colors.HexColor("#fecaca") if sev_is_severe else colors.HexColor("#fde68a")
+            sev_text_color = colors.HexColor("#b91c1c") if sev_is_severe else colors.HexColor("#b45309")
+
+            sev_label_style = ParagraphStyle(
+                "SevLabelStyle", parent=styles["Normal"],
+                fontSize=14, leading=18, alignment=TA_CENTER,
+                textColor=sev_text_color, fontName="Helvetica-Bold"
+            )
+            sev_full_style = ParagraphStyle(
+                "SevFullStyle", parent=styles["Normal"],
+                fontSize=10, alignment=TA_CENTER,
+                textColor=colors.HexColor("#475569"), fontName="Helvetica-Bold"
+            )
+            sev_desc_style = ParagraphStyle(
+                "SevDescStyle", parent=styles["Normal"],
+                fontSize=9.5, alignment=TA_CENTER, leading=14,
+                textColor=colors.HexColor("#334155")
+            )
+
+            breakdown = severity_info.get("breakdown", [])
+            breakdown_style = ParagraphStyle(
+                "SevBreakdownStyle", parent=styles["Normal"],
+                fontSize=9, alignment=TA_LEFT, leading=13,
+                textColor=colors.HexColor("#334155")
+            )
+            breakdown_lines = "<br/>".join(
+                f"&bull; {html.escape(b['name'])}: {b['value_pct']:.0f}% (weight {b['weight_pct']:.0f}%)"
+                for b in breakdown
+            )
+            crp_line = (
+                f"CRP value used: {severity_info['crp_value']:g} mg/L"
+                if severity_info.get("crp_value") is not None
+                else "CRP not entered for this scan -- composite uses X-ray/vitals signals only"
+            )
+
+            sev_inner = Table(
+                [
+                    [Paragraph(f"{severity_info['label']}  \u2014  Composite Confidence: {severity_info['confidence']:.2f}%", sev_label_style)],
+                    [Paragraph(severity_info["full_name"], sev_full_style)],
+                    [Paragraph(severity_info["description"], sev_desc_style)],
+                    [Paragraph(f"Based on {len(breakdown)} combined signal(s), not CRP alone:<br/>{breakdown_lines}", breakdown_style)],
+                    [Paragraph(crp_line, conf_style)],
+                ],
+                colWidths=[170 * mm]
+            )
+            sev_inner.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), sev_box_color),
+                ("BOX", (0, 0), (-1, -1), 1, sev_border_color),
+                ("TOPPADDING", (0, 0), (-1, 0), 12),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+                ("TOPPADDING", (0, 1), (-1, 1), 2),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+                ("LEFTPADDING", (0, 2), (-1, 3), 14),
+                ("RIGHTPADDING", (0, 2), (-1, 3), 14),
+                ("BOTTOMPADDING", (0, 2), (-1, 2), 8),
+                ("LEFTPADDING", (0, 3), (-1, 3), 14),
+                ("BOTTOMPADDING", (0, 3), (-1, 3), 8),
+                ("BOTTOMPADDING", (0, 4), (-1, 4), 12),
+            ]))
+            content.append(sev_inner)
+        else:
+            reason = severity_info["reason"] if severity_info else "Severity model unavailable."
+            content.append(Paragraph(
+                f"CAP severity could not be staged: {reason}",
+                normal_style
+            ))
+        content.append(Spacer(1, 14))
+    elif crp_row is not None and crp_row.get("flag") == "High":
+        content.append(Paragraph("CAP SEVERITY ASSESSMENT", section_style))
+        note_style = ParagraphStyle(
+            "CrpNoteStyle", parent=styles["Normal"],
+            fontSize=9.5, leading=14, textColor=colors.HexColor("#334155")
+        )
+        note_box = Table(
+            [[Paragraph(
+                f"<b>Elevated CRP Despite Normal X-Ray:</b> the chest X-ray was read as NORMAL, but the "
+                f"entered CRP ({crp_row['value']} {crp_row['unit']}) is above the standard reference range. "
+                f"CRP is a general inflammation marker and can be elevated for reasons unrelated to the lungs, "
+                f"so NSCAP/SCAP staging is not run on a NORMAL result. Please correlate with clinical findings.",
+                note_style
+            )]],
+            colWidths=[170 * mm]
+        )
+        note_box.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fffbeb")),
+            ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#fde68a")),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ]))
+        content.append(note_box)
+        content.append(Spacer(1, 14))
+
+    xray_block = [Paragraph("X-RAY WITH GRAD-CAM HEATMAP", section_style)]
+    try:
+        px_h, px_w = image_shape[0], image_shape[1]
+        target_w = 170 * mm
+        target_h = target_w * (px_h / px_w)
+
+        img_flowable = Image(image_path, width=target_w, height=target_h)
+        img_table = Table([[img_flowable]], colWidths=[170 * mm])
+        img_table.setStyle(TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        xray_block.append(img_table)
+        xray_block.append(Spacer(1, 4))
+        caption_text = (
+            "Yellow box marks the localized infected/abnormal region; red/yellow heatmap shows "
+            "where the model focused most heavily in its decision."
+            if region_localized else
+            "Highlighted (red/yellow) regions indicate areas the model weighted most heavily in its "
+            "decision. No single focal region was distinct enough to box."
+        )
+        xray_block.append(Paragraph(caption_text, conf_style))
+        xray_block.append(Spacer(1, 8))
+
+        interp_label_style = ParagraphStyle(
+            "InterpLabelStyle", parent=styles["Normal"],
+            fontSize=9, textColor=colors.HexColor("#64748b"),
+            fontName="Helvetica-Bold"
+        )
+        interp_value_style = ParagraphStyle(
+            "InterpValueStyle", parent=styles["Normal"],
+            fontSize=10.5, textColor=colors.HexColor("#0f172a"),
+            fontName="Helvetica-Bold"
+        )
+        interp_note_style = ParagraphStyle(
+            "InterpNoteStyle", parent=styles["Normal"],
+            fontSize=9.5, textColor=colors.HexColor("#334155"),
+            leading=14
+        )
+
+        interp_table = Table(
+            [
+                [Paragraph("ATTENTION INTENSITY", interp_label_style),
+                 Paragraph("REGION OF FOCUS", interp_label_style)],
+                [Paragraph(heatmap_info["intensity"], interp_value_style),
+                 Paragraph(heatmap_info["location"], interp_value_style)],
+                [Paragraph(heatmap_info["note"], interp_note_style), ""],
+            ],
+            colWidths=[85 * mm, 85 * mm]
+        )
+        interp_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("LINEBELOW", (0, 1), (-1, 1), 0.5, colors.HexColor("#e2e8f0")),
+            ("SPAN", (0, 2), (1, 2)),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        xray_block.append(interp_table)
+
+    except Exception:
+        xray_block.append(Paragraph("X-ray image could not be embedded.", normal_style))
+
+    content.append(KeepTogether(xray_block))
+
+    content.append(Spacer(1, 20))
+
+    content.append(Paragraph("ABOUT CAP SEVERITY STAGING (NSCAP / SCAP)", section_style))
+    glossary_intro_style = ParagraphStyle(
+        "GlossaryIntroStyle", parent=styles["Normal"],
+        fontSize=9, leading=13.5, textColor=colors.HexColor("#64748b"),
+        spaceAfter=8
+    )
+    content.append(Paragraph(
+        "Staging is a weighted composite of up to three signals when a case is positive for pneumonia: "
+        "the CRP severity model, how much of the lung field Grad-CAM flagged as involved on the X-ray, "
+        "and how many entered vitals/labs fall outside a severity-relevant range. It is not based on "
+        "CRP alone.",
+        glossary_intro_style
+    ))
+    glossary_term_style = ParagraphStyle(
+        "GlossaryTermStyle", parent=styles["Normal"],
+        fontSize=10, fontName="Helvetica-Bold", textColor=colors.HexColor("#0f172a"),
+        spaceBefore=4, spaceAfter=2
+    )
+    glossary_desc_style = ParagraphStyle(
+        "GlossaryDescStyle", parent=styles["Normal"],
+        fontSize=9.5, leading=14, textColor=colors.HexColor("#334155"),
+        spaceAfter=8
+    )
+    for key in ("NSCAP", "SCAP"):
+        meta = SEVERITY_INFO[key]
+        content.append(Paragraph(f"{key} &mdash; {meta['full_name']}", glossary_term_style))
+        content.append(Paragraph(meta["description"], glossary_desc_style))
+
+    content.append(Spacer(1, 12))
+
+    sign_label_style = ParagraphStyle(
+        "SignLabelStyle", parent=styles["Normal"],
+        fontSize=8.5, textColor=colors.HexColor("#94a3b8")
+    )
+    sign_table = Table(
+        [
+            ["", ""],
+            [Paragraph("Authorized Signatory", sign_label_style),
+             Paragraph("Date", sign_label_style)],
+        ],
+        colWidths=[85 * mm, 85 * mm], rowHeights=[16 * mm, 5 * mm]
+    )
+    sign_table.setStyle(TableStyle([
+        ("LINEABOVE", (0, 1), (0, 1), 0.7, colors.HexColor("#cbd5e1")),
+        ("LINEABOVE", (1, 1), (1, 1), 0.7, colors.HexColor("#cbd5e1")),
+        ("TOPPADDING", (0, 1), (-1, 1), 4),
+    ]))
+    content.append(sign_table)
+
+    content.append(Spacer(1, 14))
+    content.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#e2e8f0")))
+    content.append(Spacer(1, 8))
+    content.append(Paragraph(
+        "This report is generated by an AI-assisted screening tool (Pneumonia Detection System) and is intended to "
+        "support, not replace, evaluation by a qualified radiologist or licensed physician. "
+        "Confidence scores reflect model certainty based on training data and do not constitute a "
+        "clinical diagnosis. CAP severity staging (NSCAP/SCAP), where shown, is a weighted composite of "
+        "whichever signals were available for this case (CRP, X-ray Grad-CAM involvement extent, entered "
+        "vitals/labs) and should be correlated with full clinical assessment. Please correlate "
+        "with clinical findings and consult a healthcare professional for final interpretation.",
+        disclaimer_style
+    ))
+
+    def add_page_footer(canvas_obj, doc_obj):
+        canvas_obj.saveState()
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.setFillColor(colors.HexColor("#94a3b8"))
+        footer_text = f"Pneumonia Detection System  |  Report #{report_id}  |  Page {doc_obj.page}"
+        canvas_obj.drawCentredString(A4[0] / 2, 12 * mm, footer_text)
+        canvas_obj.restoreState()
+
+    doc.build(content, onFirstPage=add_page_footer, onLaterPages=add_page_footer)
+    return pdf_path
+
+
+@app.get("/history", response_class=HTMLResponse)
+def history():
+    try:
+        conn = get_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute("""
+                    SELECT dr.report_id, dr.report_code, dr.final_diagnosis,
+                           dr.confidence, dr.image_name, dr.created_at, dr.severity,
+                           p.full_name, p.age, p.gender
+                    FROM diagnosis_reports dr
+                    JOIN patients p ON dr.patient_id = p.patient_id
+                    ORDER BY dr.report_id DESC
+                """)
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+        db_error = None
+    except Exception as e:
+        rows = []
+        db_error = str(e)
+
+    if db_error:
+        rows_html = f"""
+        <tr><td colspan="8" style="text-align:center;padding:24px;color:#b91c1c;">
+            Could not load records: {html.escape(db_error)}
+        </td></tr>"""
+    elif not rows:
+        rows_html = """
+        <tr><td colspan="8" style="text-align:center;padding:24px;color:#94a3b8;">
+            No records saved yet. Run a scan from the home page first.
+        </td></tr>"""
+    else:
+        rows_html = ""
+        for r in rows:
+            is_positive = "PNEUMONIA" in (r["final_diagnosis"] or "").upper()
+            flag_class = "High" if is_positive else "Normal"
+            created = r["created_at"].strftime("%d %b %Y, %I:%M %p") if r["created_at"] else "-"
+            severity_val = r.get("severity") or "-"
+            rows_html += f"""
+            <tr>
+                <td>{html.escape(r['report_code'] or '-')}</td>
+                <td>{html.escape(r['full_name'] or '-')}</td>
+                <td>{html.escape(str(r['age']) if r['age'] is not None else '-')}</td>
+                <td>{html.escape(r['gender'] or '-')}</td>
+                <td><span class="flag-pill {flag_class}">{html.escape(r['final_diagnosis'] or '-')}</span></td>
+                <td>{r['confidence']}%</td>
+                <td class="range-col">{html.escape(str(severity_val))}</td>
+                <td class="range-col">{created}</td>
+                <td><a href="/download?report_id={r['report_code']}" class="btn btn-outline" style="width:auto;padding:6px 14px;font-size:12.5px;display:inline-flex;">⬇ PDF</a></td>
+            </tr>"""
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Saved Records &middot; Pneumonia Detection System</title>
+<style>{BASE_CSS}</style>
+</head>
+
+<body>
+
+<div class="shell">
+
+  <div class="brand">
+    <div class="logo">🫁</div>
+
+    <h1>
+      Pneumonia Detection System
+      <span>All Saved Patients &amp; Reports</span>
+    </h1>
+  </div>
+
+  <div class="card">
+    <div class="card-pad">
+
+      <div class="actions" style="margin-bottom:22px;">
+
+        <a href="/" class="btn btn-outline">
+          ↺ New Scan
+        </a>
+
+        <a href="http://localhost:8503" class="btn btn-outline">
+           Go to Home
+        </a>
+
+      </div>
+
+      <div class="lab-card">
+        <table class="lab-table">
+
+          <thead>
+            <tr>
+              <th>Report ID</th>
+              <th>Patient</th>
+              <th>Age</th>
+              <th>Gender</th>
+              <th>Result</th>
+              <th>Confidence</th>
+              <th>Severity</th>
+              <th>Date</th>
+              <th>PDF</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows_html}
+          </tbody>
+
+        </table>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
+"""
+
+
+def find_pdf_path(report_id: str):
+
+    report_id = report_id.strip().upper()
+
+    pdf_path = PDF_STORE.get(report_id)
+
+    if pdf_path and os.path.isfile(pdf_path):
+        return os.path.abspath(pdf_path)
+
+    try:
+
+        conn = get_connection()
+
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            """
+            SELECT pdf_path
+            FROM diagnosis_reports
+            WHERE UPPER(report_code) = %s
+            LIMIT 1
+            """,
+            (report_id,)
+        )
+
+        row = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if row:
+
+            print("Database row:", row)
+
+            db_path = row.get("pdf_path")
+
+            if db_path:
+
+                db_path = os.path.normpath(db_path)
+
+                print("PDF path from database:", db_path)
+
+                if os.path.isfile(db_path):
+
+                    PDF_STORE[report_id] = db_path
+
+                    return os.path.abspath(db_path)
+
+                reports_folder = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "reports"
+                )
+
+                filename = os.path.basename(db_path)
+
+                local_pdf_path = os.path.join(
+                    reports_folder,
+                    filename
+                )
+
+                print(
+                    "Checking local PDF:",
+                    local_pdf_path
+                )
+
+                if os.path.isfile(local_pdf_path):
+
+                    PDF_STORE[report_id] = local_pdf_path
+
+                    return os.path.abspath(local_pdf_path)
+
+    except Exception as e:
+
+        print(
+            "Database PDF lookup error:",
+            e
+        )
+
+    reports_folder = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "reports"
+    )
+
+    fallback_path = os.path.join(
+        reports_folder,
+        f"report_{report_id}.pdf"
+    )
+
+    print(
+        "Checking fallback PDF:",
+        fallback_path
+    )
+
+    if os.path.isfile(fallback_path):
+
+        PDF_STORE[report_id] = fallback_path
+
+        return os.path.abspath(fallback_path)
+
+    print(
+        "PDF NOT FOUND FOR REPORT:",
+        report_id
+    )
+
+    return None
+
+
+@app.get("/download")
+def download_pdf(report_id: str = ""):
+
+    if not report_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Report ID is required"
+        )
+
+    pdf_path = find_pdf_path(report_id)
+
+    if not pdf_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"PDF report not found for report ID: {report_id}"
+        )
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=os.path.basename(pdf_path),
+        content_disposition_type="inline"
+    )
+
+
+@app.get("/download/{report_id}")
+def view_pdf(report_id: str):
+
+    if not report_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Report ID is required"
+        )
+
+    pdf_path = find_pdf_path(report_id)
+
+    if not pdf_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"PDF report not found for report ID: {report_id}"
+        )
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=os.path.basename(pdf_path),
+        content_disposition_type="inline"
+    )
+
+
+@app.get("/patients")
+def get_patients():
+    conn = get_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM patients ORDER BY patient_id DESC")
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/reports")
+def get_reports():
+    conn = get_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM diagnosis_reports ORDER BY report_id DESC")
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Databases and local data
+*.db
+*.sqlite
+*.sqlite3
+
+# Patient/private data
+patient_images/
+*.xlsx
+
+# Generated files
+reports/
+uploads/
+
+# ML model files
+*.h5
+*.keras
+*.pth
+*.pt
+
+# Backup files
+*.bak
