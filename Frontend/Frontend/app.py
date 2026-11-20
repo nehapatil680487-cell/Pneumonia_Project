@@ -28,7 +28,7 @@ def get_base64(file_path):
 img_base64 = get_base64(
     str(Path(__file__).parent / "images" / "final.jpeg")
 )
-)
+
 
 
 # ---------- SYSTEM PROGRESS CONFIG ----------
