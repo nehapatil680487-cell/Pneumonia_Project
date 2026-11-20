@@ -1,12 +1,18 @@
 import mysql.connector
+import os
+
 
 def get_connection():
     return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="System",
-        database="pneumonia_project"
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        port=int(os.getenv("DB_PORT", 4000)),
+        ssl_ca=os.path.join(os.path.dirname(__file__), "isrgrootx1.pem"),
+        ssl_verify_cert=True
     )
+
 
 
 # =========================
