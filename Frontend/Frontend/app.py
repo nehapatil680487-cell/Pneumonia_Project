@@ -1,6 +1,7 @@
 import streamlit as st
 import base64
 import mysql.connector
+from pathlib import Path
 
 
 # ---------- PAGE CONFIG ----------
@@ -25,7 +26,8 @@ def get_base64(file_path):
 
 
 img_base64 = get_base64(
-    "images/final.jpeg"
+    str(Path(__file__).parent / "images" / "final.jpeg")
+)
 )
 
 
