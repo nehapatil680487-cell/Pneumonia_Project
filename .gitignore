@@ -33,8 +33,6 @@ reports/
 uploads/
 
 # ML model files
-*.h5
-*.keras
 *.pth
 *.pt
 
