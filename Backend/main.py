@@ -3,6 +3,16 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import get_connection
 
+from fusion import (
+    combine_stage1,
+    headline_for,
+    result_class_for,
+    LIKELY,
+    POSSIBLE,
+    INCONCLUSIVE,
+    NEGATIVE
+)
+
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import tensorflow as tf
@@ -27,6 +37,19 @@ import joblib
 from datetime import datetime
 from openpyxl import load_workbook
 
+# ReportLab (PDF report)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+                                Image, HRFlowable, KeepTogether, PageBreak)
+
+# Stage-1 decision fusion (fusion.py must sit next to this file)
+from fusion import (combine_stage1, headline_for, result_class_for,
+                    LIKELY, POSSIBLE, INCONCLUSIVE, NEGATIVE)
+
 # =========================
 # APP SETUP
 # =========================
@@ -43,7 +66,8 @@ app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 IMG_SIZE = 224
 
 # "Go to Home" buttons send the user back to the Streamlit landing page.
-STREAMLIT_URL = "http://localhost:8501/"
+# On Render, set the STREAMLIT_URL environment variable to your deployed Streamlit URL.
+STREAMLIT_URL = os.environ.get("STREAMLIT_URL", "http://localhost:8501/")
 
 # =========================
 # MODEL OUTPUT POLARITY
@@ -85,21 +109,18 @@ def cleanup_stale_pdf_store_entries():
         PDF_STORE.pop(rid, None)
 
 
-
 # =========================
 # LOAD MODELS
 # =========================
-
-# 1. X-RAY CNN MODEL (DenseNet121)
 try:
     model = load_model("final_model.keras", compile=False)
-    print("X-Ray model loaded successfully")
+    print("Model loaded successfully")
 except Exception as e:
     model = None
-    print("X-Ray model load error:", e)
+    print("Model load error:", e)
 
-
-# 2. BLOOD ANN MODEL
+# --- Blood ANN (Stage 1 signal) ---
+# If the model files have different names, change these three lines only.
 BLOOD_MODEL_FILE = "blood_model (3).h5"
 BLOOD_SCALER_FILE = "blood_scaler (1).pkl"
 BLOOD_FEATURES_FILE = "blood_features.pkl"
@@ -107,74 +128,53 @@ BLOOD_FEATURES_FILE = "blood_features.pkl"
 try:
     blood_model = load_model(BLOOD_MODEL_FILE, compile=False)
     blood_scaler = joblib.load(BLOOD_SCALER_FILE)
-
     try:
+        # Saved by the training notebook: exact column order the model was trained on
         BLOOD_FEATURE_ORDER = list(joblib.load(BLOOD_FEATURES_FILE))
     except Exception:
-        BLOOD_FEATURE_ORDER = [
-            "Age",
-            "Gender",
-            "Hemoglobin",
-            "Platelet_Count",
-            "White_Blood_Cells",
-            "Red_Blood_Cells",
-            "MCV",
-            "MCH",
-            "MCHC"
-        ]
+        BLOOD_FEATURE_ORDER = ["Age", "Gender", "Hemoglobin", "Platelet_Count",
+                               "White_Blood_Cells", "Red_Blood_Cells", "MCV", "MCH", "MCHC"]
 
     n_feat = len(BLOOD_FEATURE_ORDER)
-
-    if (
-        getattr(blood_scaler, "n_features_in_", n_feat) != n_feat
-        or blood_model.input_shape[-1] != n_feat
-    ):
+    if getattr(blood_scaler, "n_features_in_", n_feat) != n_feat or blood_model.input_shape[-1] != n_feat:
         raise ValueError(
-            "Blood model/scaler/features files do not match."
+            f"Blood model/scaler/features files do not match "
+            f"(features={n_feat}, scaler={getattr(blood_scaler, 'n_features_in_', '?')}, "
+            f"model={blood_model.input_shape[-1]}). Copy all 3 files together."
         )
 
-    _blood_mean = dict(
-        zip(BLOOD_FEATURE_ORDER, blood_scaler.mean_)
-    )
-
-    print("Blood ANN model loaded successfully")
-
+    _blood_mean = dict(zip(BLOOD_FEATURE_ORDER, blood_scaler.mean_))
+    print("Blood ANN model loaded successfully. Features:", BLOOD_FEATURE_ORDER)
 except Exception as e:
     blood_model = None
     blood_scaler = None
     BLOOD_FEATURE_ORDER = []
     _blood_mean = {}
-
     print("Blood ANN model load error:", e)
 
-
-# 3. OXYGEN ANN MODEL
+# --- Oxygen ANN (Stage 1 signal) ---
+# Note: the files on disk have a space before the bracket, e.g. "oxygen_model (2).h5".
 OXYGEN_MODEL_FILE = "oxygen_model (2).h5"
 OXYGEN_SCALER_FILE = "oxygen_scaler (1).pkl"
 
 try:
     oxygen_model = load_model(OXYGEN_MODEL_FILE, compile=False)
     oxygen_scaler = joblib.load(OXYGEN_SCALER_FILE)
-
-    OXYGEN_FEATURE_ORDER = [
-        "pulse_rate",
-        "temperature",
-        "spo2"
-    ]
-
-    OXYGEN_CLASS_LABELS = [
-        "Normal",
-        "Low oxygen",
-        "Very low oxygen"
-    ]
-
+    # Training order was X = data[["pulse", "body temperature", "SpO2"]].
+    # The scaler and network expect exactly this order.
+    OXYGEN_FEATURE_ORDER = ["pulse_rate", "temperature", "spo2"]
+    # Labels from the training notebook: 0 = Normal, 1 = Low Oxygen, 2 = Very Low Oxygen.
+    OXYGEN_CLASS_LABELS = ["Normal", "Low oxygen", "Very low oxygen"]
     print("Oxygen ANN model loaded successfully")
-
+    try:
+        print("Oxygen scaler mean_ (expect [pulse, temp(C), spo2]):", oxygen_scaler.mean_)
+    except Exception:
+        pass
 except Exception as e:
     oxygen_model = None
     oxygen_scaler = None
-
     print("Oxygen ANN model load error:", e)
+
 
 # =========================
 # PREPROCESS IMAGE
@@ -443,7 +443,7 @@ def predict_blood_ann(age_raw, hb_raw, platelet_raw, wbc_raw, rbc_raw, gender_ra
 
         X = np.array([row], dtype="float32")
         X_scaled = blood_scaler.transform(X)
-        out = np.asarray(blood_model.predict(X_scaled, verbose=0)).ravel()
+        out = np.asarray(blood_model(X_scaled, training=False)).ravel()
         prob = float(out[-1])                   # works for sigmoid (1 value) and softmax (2 values: class 1)
         return {"available": True, "prob": prob, "is_positive": prob > 0.5, "partial_profile": True}
     except Exception as e:
@@ -476,7 +476,7 @@ def predict_oxygen_ann(spo2_raw, pulse_rate_raw, temperature_raw):
         # Feature order must match training: [pulse, body temperature, SpO2].
         X = np.array([[pulse_rate, temperature, spo2]], dtype="float32")
         X_scaled = oxygen_scaler.transform(X)
-        probs = oxygen_model.predict(X_scaled, verbose=0).squeeze()
+        probs = oxygen_model(X_scaled, training=False).numpy().squeeze()
         probs = [float(p) for p in probs]
         class_idx = int(np.argmax(probs))
         p_pos = 1.0 - probs[0]            # class 0 = Normal
@@ -1767,7 +1767,7 @@ async def predict(
 
         img, img_array = preprocess(contents)
 
-        pred = model.predict(img_array)
+        pred = model(img_array, training=False).numpy()
         raw_prob = float(pred.squeeze())
         pneumonia_prob = raw_prob if POSITIVE_CLASS_IS_PNEUMONIA_WHEN_PROB_HIGH else (1 - raw_prob)
         print(f"[predict] raw_model_output={raw_prob:.4f}  pneumonia_prob={pneumonia_prob:.4f}  "
