@@ -3,12 +3,22 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import get_connection
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
+# TensorFlow CPU configuration for Render
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    pass
+
 import numpy as np
 import cv2
-import os
 import re
 import uuid
 import html
@@ -16,22 +26,6 @@ import traceback
 import joblib
 from datetime import datetime
 from openpyxl import load_workbook
-
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
-    HRFlowable, KeepTogether, PageBreak
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-
-# Corrected decision-fusion logic (see fusion.py)
-from fusion import (
-    combine_stage1, headline_for, result_class_for,
-    LIKELY, POSSIBLE, INCONCLUSIVE, NEGATIVE,
-)
 
 # =========================
 # APP SETUP
