@@ -14,3 +14,4 @@ joblib
 openpyxl
 reportlab
 python-multipart
+scikit-learn
