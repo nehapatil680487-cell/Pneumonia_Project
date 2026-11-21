@@ -85,76 +85,96 @@ def cleanup_stale_pdf_store_entries():
         PDF_STORE.pop(rid, None)
 
 
+
 # =========================
 # LOAD MODELS
 # =========================
+
+# 1. X-RAY CNN MODEL (DenseNet121)
 try:
-    model = load_model("final_model.keras")
-    try:
-        _ = model(np.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype="float32"))
-    except Exception as build_err:
-        print("Model warm-up call failed (non-fatal):", build_err)
-    print("Model loaded successfully")
+    model = load_model("final_model.keras", compile=False)
+    print("X-Ray model loaded successfully")
 except Exception as e:
     model = None
-    print("Model load error:", e)
+    print("X-Ray model load error:", e)
 
-# --- Blood ANN (Stage 1 signal) ---
-# If the model files have different names, change these three lines only.
+
+# 2. BLOOD ANN MODEL
 BLOOD_MODEL_FILE = "blood_model (3).h5"
 BLOOD_SCALER_FILE = "blood_scaler (1).pkl"
 BLOOD_FEATURES_FILE = "blood_features.pkl"
 
 try:
-    blood_model = load_model(BLOOD_MODEL_FILE)
+    blood_model = load_model(BLOOD_MODEL_FILE, compile=False)
     blood_scaler = joblib.load(BLOOD_SCALER_FILE)
+
     try:
-        # Saved by the training notebook: exact column order the model was trained on
         BLOOD_FEATURE_ORDER = list(joblib.load(BLOOD_FEATURES_FILE))
     except Exception:
-        BLOOD_FEATURE_ORDER = ["Age", "Gender", "Hemoglobin", "Platelet_Count",
-                               "White_Blood_Cells", "Red_Blood_Cells", "MCV", "MCH", "MCHC"]
+        BLOOD_FEATURE_ORDER = [
+            "Age",
+            "Gender",
+            "Hemoglobin",
+            "Platelet_Count",
+            "White_Blood_Cells",
+            "Red_Blood_Cells",
+            "MCV",
+            "MCH",
+            "MCHC"
+        ]
 
     n_feat = len(BLOOD_FEATURE_ORDER)
-    if getattr(blood_scaler, "n_features_in_", n_feat) != n_feat or blood_model.input_shape[-1] != n_feat:
+
+    if (
+        getattr(blood_scaler, "n_features_in_", n_feat) != n_feat
+        or blood_model.input_shape[-1] != n_feat
+    ):
         raise ValueError(
-            f"Blood model/scaler/features files do not match "
-            f"(features={n_feat}, scaler={getattr(blood_scaler, 'n_features_in_', '?')}, "
-            f"model={blood_model.input_shape[-1]}). Copy all 3 files together."
+            "Blood model/scaler/features files do not match."
         )
 
-    _blood_mean = dict(zip(BLOOD_FEATURE_ORDER, blood_scaler.mean_))
-    print("Blood ANN model loaded successfully. Features:", BLOOD_FEATURE_ORDER)
+    _blood_mean = dict(
+        zip(BLOOD_FEATURE_ORDER, blood_scaler.mean_)
+    )
+
+    print("Blood ANN model loaded successfully")
+
 except Exception as e:
     blood_model = None
     blood_scaler = None
     BLOOD_FEATURE_ORDER = []
     _blood_mean = {}
+
     print("Blood ANN model load error:", e)
 
-# --- Oxygen ANN (Stage 1 signal) ---
-# Note: the files on disk have a space before the bracket, e.g. "oxygen_model (2).h5".
+
+# 3. OXYGEN ANN MODEL
 OXYGEN_MODEL_FILE = "oxygen_model (2).h5"
 OXYGEN_SCALER_FILE = "oxygen_scaler (1).pkl"
 
 try:
-    oxygen_model = load_model(OXYGEN_MODEL_FILE)
+    oxygen_model = load_model(OXYGEN_MODEL_FILE, compile=False)
     oxygen_scaler = joblib.load(OXYGEN_SCALER_FILE)
-    # Training order was X = data[["pulse", "body temperature", "SpO2"]].
-    # The scaler and network expect exactly this order.
-    OXYGEN_FEATURE_ORDER = ["pulse_rate", "temperature", "spo2"]
-    # Labels from the training notebook: 0 = Normal, 1 = Low Oxygen, 2 = Very Low Oxygen.
-    OXYGEN_CLASS_LABELS = ["Normal", "Low oxygen", "Very low oxygen"]
+
+    OXYGEN_FEATURE_ORDER = [
+        "pulse_rate",
+        "temperature",
+        "spo2"
+    ]
+
+    OXYGEN_CLASS_LABELS = [
+        "Normal",
+        "Low oxygen",
+        "Very low oxygen"
+    ]
+
     print("Oxygen ANN model loaded successfully")
-    try:
-        print("Oxygen scaler mean_ (expect [pulse, temp(C), spo2]):", oxygen_scaler.mean_)
-    except Exception:
-        pass
+
 except Exception as e:
     oxygen_model = None
     oxygen_scaler = None
-    print("Oxygen ANN model load error:", e)
 
+    print("Oxygen ANN model load error:", e)
 
 # =========================
 # PREPROCESS IMAGE
