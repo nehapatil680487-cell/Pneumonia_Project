@@ -1819,9 +1819,11 @@ async def predict(
         stage1_patient_html = build_stage1_patient_html(stage1_result)
         stage1_tech_html = build_stage1_technical_html(stage1_result)
 
-        # ---- Grad-CAM: driven by the X-RAY model's own prediction, not the fused result ----
-        last_conv, layer_owner = get_last_conv(model)
-        heatmap = gradcam(model, img_array, last_conv, layer_owner)
+        # ---- Grad-CAM: TEMPORARILY BYPASSED FOR TESTING ----
+        # To restore: uncomment the two lines below and delete the np.zeros line.
+        # last_conv, layer_owner = get_last_conv(model)
+        # heatmap = gradcam(model, img_array, last_conv, layer_owner)
+        heatmap = np.zeros((IMG_SIZE, IMG_SIZE), dtype="float32")
         if xray_positive and float(np.max(heatmap)) <= 1e-6:
             print("[QA] X-ray model is positive but Grad-CAM is empty - check the Grad-CAM layer/pipeline.")
 
